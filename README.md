@@ -1,5 +1,7 @@
 # Space++ — Simulateur de trou noir (sandbox)
 
+[![build](https://github.com/bc1pzzfnxl/space-plus-plus/actions/workflows/build.yml/badge.svg)](https://github.com/bc1pzzfnxl/space-plus-plus/actions/workflows/build.yml)
+
 Sandbox de simulation en C++20 / OpenGL 4.6 : lentilles de Schwarzschild tracées
 au rayon (RK4), disque d'accrétion lumineux et animé, grille d'espace-temps
 déformée, essaim de particules en orbite (géodésiques timelike RK4, capture
