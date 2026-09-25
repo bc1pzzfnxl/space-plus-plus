@@ -209,6 +209,7 @@ struct CometSystem {
 
   bool running = true;         // live from launch: this is a sandbox
   float speed = 1.0F;          // simulated steps per rendered frame (0.25 .. 4)
+  float time_scale = 1.0F;     // Kepler clock (1/ sqrt(M/M_sun)): heavier = slower
   float spawn_radius = 18.0F;  // r at birth [M]
   float eccentricity = 0.3F;   // 0.05 .. 0.6: distance from circular
   float max_inclination = 2.4F;
@@ -315,7 +316,7 @@ struct CometSystem {
   // fractional remainder so 0.25x/0.5x slow motion stays smooth.
   void advance() noexcept
   {
-    accumulator_ += speed;
+    accumulator_ += speed * time_scale;
     int steps = 0;
     while (accumulator_ >= 1.0F && steps < 8) {
       step();
@@ -761,11 +762,12 @@ public:
   GridPass(const GridPass&) = delete;
   GridPass& operator=(const GridPass&) = delete;
 
-  void draw(const glm::mat4& mvp, int width, int height, float pixel_size) const
+  void draw(const glm::mat4& mvp, int width, int height, float pixel_size,
+            float mass) const
   {
     glUseProgram(program_);
     glUniformMatrix4fv(locations_.mvp, 1, GL_FALSE, glm::value_ptr(mvp));
-    glUniform1f(locations_.mass, k_geometric_mass);
+    glUniform1f(locations_.mass, mass);
     glUniform1f(locations_.max_radius, k_grid_max_radius);
     glUniform2f(locations_.resolution, static_cast<float>(width),
                 static_cast<float>(height));
@@ -1007,6 +1009,7 @@ struct RunOptions {
   std::optional<float> click_y;
   float pixel_size = 1.0F;          // retro block size (1 = native)
   bool polish = false;              // bloom + FXAA post chain
+  float mass_solar = 1.0F;          // section-5 mass slider override
 };
 
 // Parses CLI flags; exits via throw on bad input (E.2).
@@ -1037,11 +1040,13 @@ struct RunOptions {
       }
     } else if (arg == "--polish") {
       options.polish = true;
+    } else if (arg == "--mass" && i + 1 < argc) {
+      options.mass_solar = std::strtof(argv[++i], nullptr);
     } else {
       throw std::invalid_argument{
           "usage: blackhole [--frames N] [--screenshot file.bmp] "
           "[--az degrees] [--orbit rad/s] [--anim] [--spawn N] [--click fx fy] "
-          "[--pixel [N]] [--polish]"};
+          "[--pixel [N]] [--polish] [--mass M_sun]"};
     }
   }
   if (!options.screenshot_path.empty() && options.frame_limit < 0) {
@@ -1298,7 +1303,7 @@ int main(int argc, char* argv[])
     render_prefs.pixel_size = glm::max(options.pixel_size, 1.0F);
     render_prefs.polish = options.polish;
     DiskParams disk;
-    float hud_mass_solar = 1.0F;
+    float hud_mass_solar = options.mass_solar;
     CometSystem comets;
     if (options.animate) {
       comets.running = true;
@@ -1395,6 +1400,14 @@ int main(int argc, char* argv[])
         ImGui::NewFrame();
         draw_settings_ui(orbit, disk, hud_mass_solar, comets, render_prefs);
 
+        // Spec section 5 mass slider now drives the scene: heavier = deeper
+        // rubber-sheet funnel (compressed M^0.25) and slower orbital clocks
+        // (Kepler T ~ M, sqrt-compressed; 1 M_sun keeps today's speed).
+        const float mass_clamped = std::clamp(hud_mass_solar, 0.1F, 100.0F);
+        const float grid_mass = k_geometric_mass * std::pow(mass_clamped, 0.25F);
+        const float time_speed = 1.0F / std::sqrt(mass_clamped);
+        comets.time_scale = time_speed;
+
         if (render_prefs.polish) {
           glBindFramebuffer(GL_FRAMEBUFFER,
                             post_chain.scene_fbo(drawable_width, drawable_height));
@@ -1406,10 +1419,10 @@ int main(int argc, char* argv[])
         glClearColor(0.01F, 0.01F, 0.03F, 1.0F);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         raytrace_pass.draw(camera, disk, comets, drawable_width, drawable_height,
-                           static_cast<float>(frame) / 60.0F,
+                           static_cast<float>(frame) / 60.0F * time_speed,
                            render_prefs.pixel_size);
         grid_pass.draw(projection * view, drawable_width, drawable_height,
-                       render_prefs.pixel_size);
+                       render_prefs.pixel_size, grid_mass);
         if (render_prefs.polish) {
           post_chain.render(drawable_width, drawable_height,
                             render_prefs.pixel_size, render_prefs.bloom_strength);
