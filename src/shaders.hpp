@@ -45,6 +45,7 @@ uniform vec4 u_comet_head[16];     // xyz world position, w = intensity (0 = dea
 uniform vec4 u_comet_trail[128];   // [i*8+k] xyz point, w = fade (0 = none)
 uniform vec2 u_resolution;         // framebuffer size [px]
 uniform float u_pixel;             // retro block size (1 = native, >1 snaps rays)
+uniform vec4 u_realism;            // x = plunge, y = jets, z = ergo, w = turbulence
 
 const int k_max_steps = 900;
 const float k_step_r = 0.30;   // max |dr| per Mino-time step
@@ -130,7 +131,17 @@ void disk_emission(float r, float phi, float lambda, out vec3 color,
   // peak value 0.0566 at r = (49/36) r_in.
   const float flux_shape = (1.0 - sqrt(x)) * x * x * x;
   const float flux_peak = 0.0566;
-  const float flux = clamp(flux_shape / flux_peak, 0.0, 1.0);
+  float flux = clamp(flux_shape / flux_peak, 0.0, 1.0);
+
+  // Plunging region (spec section 6): gas between the horizon and the ISCO
+  // still radiates, dimmer and tapering to zero at r_plus.
+  const float r_plus_e =
+      u_mass + sqrt(max(u_mass * u_mass - kerr_a() * kerr_a(), 0.0));
+  if (r < u_disk_inner && u_realism.x > 0.5) {
+    flux = 0.15 * pow(clamp((r - r_plus_e) / max(u_disk_inner - r_plus_e, 1e-3),
+                            0.0, 1.0),
+                      1.5);
+  }
 
   // Kerr equatorial circular-orbit angular velocity, spec 4.1:
   // Omega_K = 1 / (r^{3/2} + a); reduces to Keplerian at a = 0.
@@ -157,16 +168,21 @@ void disk_emission(float r, float phi, float lambda, out vec3 color,
   // shears and the disk visibly spins (sandbox liveliness, texture only -
   // the g^4 physics above is untouched).
   const float advected = phi - omega * u_time * 6.0;
-  const float shimmer =
-      1.0 + 0.12 * sin(6.0 * advected) +
-      0.08 * sin(11.0 * advected - 14.0 * r);
+  float shimmer = 1.0;
+  if (u_realism.w > 0.5) {
+    shimmer = 1.0 + 0.12 * sin(6.0 * advected) +
+              0.08 * sin(11.0 * advected - 14.0 * r);
+  }
 
   color = blackbody(g * temperature) * pow(g, 4.0) * flux *
           u_disk_brightness * shimmer;
 
   const float fade = 1.5;
-  alpha = smoothstep(u_disk_inner, u_disk_inner + 0.6, r) *
-          (1.0 - smoothstep(u_disk_outer - fade, u_disk_outer, r));
+  float alpha_in = smoothstep(u_disk_inner, u_disk_inner + 0.6, r);
+  if (r < u_disk_inner && u_realism.x > 0.5) {
+    alpha_in = smoothstep(r_plus_e, r_plus_e + 0.3, r);
+  }
+  alpha = alpha_in * (1.0 - smoothstep(u_disk_outer - fade, u_disk_outer, r));
 }
 
 // ----------------------------------------------------------------------------
@@ -349,6 +365,8 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
   // once the frontmost disk hit is found so the disk occludes the rest.
   vec3 glow = vec3(0.0);
   bool glow_frozen = false;
+  vec3 jet = vec3(0.0);
+  float ergo = 0.0;
 
   for (int step = 0; step < k_max_steps; ++step) {
     if (s.r <= r_plus + 1e-4 * M) {
@@ -401,11 +419,39 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
       s.ph += k_pi;
     }
 
+    // Ergosphere surface r_E(theta) = M + sqrt(M^2 - a^2 cos^2 theta)
+    // (spec 2.3): glow where the ray pierces it, outside-in only.
+    if (u_realism.z > 0.5) {
+      const float ce = cos(s.th);
+      const float ce_p = cos(prev.th);
+      const float r_e = M + sqrt(max(M * M - a * a * ce * ce, 0.0));
+      const float r_e_p = M + sqrt(max(M * M - a * a * ce_p * ce_p, 0.0));
+      if (r_e > r_plus + 1e-3 * M && prev.r > r_e_p && s.r <= r_e) {
+        ergo += 1.0;
+      }
+    }
+
+    // Polar jets: soft cone along the rotation axis with advected knots.
+    if (u_realism.y > 0.5) {
+      const float zj = abs(s.r * cos(s.th));
+      const float rho = s.r * sin(s.th);
+      const float wid = 0.3 + 0.09 * zj;
+      if (rho < wid && zj < 45.0) {
+        const float core = pow(1.0 - rho / wid, 2.0);
+        const float axial = smoothstep(1.5, 4.0, zj) *
+                            (1.0 - smoothstep(30.0, 45.0, zj));
+        const float knots = 0.7 + 0.3 * sin(2.5 * zj - u_time * 6.0);
+        jet += vec3(0.45, 0.65, 1.0) * core * axial * knots *
+               min(dtau, 0.05) * 2.5;
+      }
+    }
+
     // Equatorial crossings inside this step (multiple disk images included).
     if (cos(prev.th) * cos(s.th) < 0.0) {
       const float t = clamp((0.5 * k_pi - prev.th) / (s.th - prev.th), 0.0, 1.0);
       const float rh = mix(prev.r, s.r, t);
-      if (rh > r_plus && rh >= u_disk_inner && rh <= u_disk_outer &&
+      const float r_floor = u_realism.x > 0.5 ? r_plus + 1e-3 * M : u_disk_inner;
+      if (rh > r_plus && rh >= r_floor && rh <= u_disk_outer &&
           hit_count < k_max_hits) {
         hit_r[hit_count] = rh;
         hit_ph[hit_count] = mix(prev.ph, s.ph, t);
@@ -503,7 +549,12 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     disk_emission(hit_r[i], hit_ph[i], -xi, emission, alpha);
     color = mix(color, emission, alpha);
   }
-  return color + glow;
+  // Ergosphere glow only on rays that pierce and escape: captured rays all
+  // cross r_E once on the way in, which would paint the whole shadow green.
+  if (escaped) {
+    color += ergo * vec3(0.15, 0.9, 0.45) * 0.3;
+  }
+  return color + glow + jet;
 }
 
 void main()

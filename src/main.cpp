@@ -663,6 +663,7 @@ public:
     locations_.comet_trail = glGetUniformLocation(program_, "u_comet_trail[0]");
     locations_.resolution = glGetUniformLocation(program_, "u_resolution");
     locations_.pixel = glGetUniformLocation(program_, "u_pixel");
+    locations_.realism = glGetUniformLocation(program_, "u_realism");
   }
 
   ~RaytracePass()
@@ -676,7 +677,7 @@ public:
 
   void draw(const Camera& camera, const DiskParams& disk, const CometSystem& comets,
             int width, int height, float time_seconds, float pixel_size,
-            float spin) const
+            float spin, const glm::vec4& realism) const
   {
     glViewport(0, 0, width, height);
     glUseProgram(program_);
@@ -709,6 +710,7 @@ public:
                  glm::value_ptr(comets.head_uniforms[0]));
     glUniform4fv(locations_.comet_trail, CometSystem::k_count * CometSystem::k_trail,
                  glm::value_ptr(comets.trail_uniforms[0]));
+    glUniform4f(locations_.realism, realism.x, realism.y, realism.z, realism.w);
 
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -728,6 +730,7 @@ private:
     GLint proj_far = -1;
     GLint disk_inner = -1;
     GLint disk_outer = -1;
+    GLint realism = -1;
     GLint disk_temperature = -1;
     GLint disk_brightness = -1;
     GLint time = -1;
@@ -1146,6 +1149,10 @@ struct RenderPrefs {
   float pixel_size = 1.0F;
   bool polish = false;
   float bloom_strength = 0.5F;
+  bool realism_plunge = true;
+  bool realism_jets = true;
+  bool realism_ergo = true;
+  bool realism_turbulence = true;
 };
 
 // English control panel (spec section 3): camera, disk, animation, thermodynamics.
@@ -1245,6 +1252,12 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   ImGui::SetNextItemWidth(-1.0F);
   ImGui::SliderFloat("##bloom", &render_prefs.bloom_strength, 0.0F, 1.5F,
                      "Bloom x%.2f");
+  ImGui::Separator();
+  ImGui::TextUnformatted("Realism");
+  ImGui::Checkbox("Plunging region", &render_prefs.realism_plunge);
+  ImGui::Checkbox("Polar jets", &render_prefs.realism_jets);
+  ImGui::Checkbox("Ergosphere glow", &render_prefs.realism_ergo);
+  ImGui::Checkbox("Disk turbulence", &render_prefs.realism_turbulence);
   ImGui::End();
 
   // Right column: keep clear of the Settings window on first use.
@@ -1458,7 +1471,13 @@ int main(int argc, char* argv[])
         raytrace_pass.draw(camera, disk, comets, drawable_width, drawable_height,
                            static_cast<float>(frame) / 60.0F * time_speed,
                            render_prefs.pixel_size,
-                           std::clamp(hud_spin, -0.95F, 0.95F));
+                           std::clamp(hud_spin, -0.95F, 0.95F),
+                           glm::vec4(render_prefs.realism_plunge
+                                         ? 1.0F
+                                         : 0.0F,
+                                     render_prefs.realism_jets ? 1.0F : 0.0F,
+                                     render_prefs.realism_ergo ? 1.0F : 0.0F,
+                                     render_prefs.realism_turbulence ? 1.0F : 0.0F));
         grid_pass.draw(projection * view, drawable_width, drawable_height,
                        render_prefs.pixel_size, grid_mass);
         if (render_prefs.polish) {
