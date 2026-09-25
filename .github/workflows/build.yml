@@ -14,8 +14,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            g++ cmake ninja-build libsdl2-dev libglew-dev libglm-dev \
-            xvfb mesa-utils libegl-mesa0 libgl1-mesa-dri
+            g++ cmake ninja-build libsdl2-dev libglew-dev libglm-dev
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -23,26 +22,8 @@ jobs:
       - name: Build
         run: cmake --build build -j4
 
-      - name: GL info under xvfb
-        continue-on-error: true
-        run: |
-          xvfb-run -a -s "-screen 0 1280x720x24" glxinfo | \
-            grep -E "direct rendering|OpenGL core profile version" || true
-
-      - name: Smoke test (llvmpipe under xvfb, EGL)
-        continue-on-error: true
-        run: |
-          xvfb-run -a -s "-screen 0 1280x720x24" \
-            env LIBGL_ALWAYS_SOFTWARE=1 SDL_VIDEO_X11_FORCE_EGL=1 \
-            ./build/blackhole --frames 10 --anim --orbit 0 \
-            --pixel 4 --polish --screenshot smoke.bmp
-
-      - name: Upload smoke screenshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-smoke
-          path: smoke.bmp
-          if-no-files-found: ignore
+      # No GL run here: runner software GL tops at 4.5, the app requires 4.6.
+      # Runtime testing happens locally and on real GPUs (see BUILD_WINDOWS.md).
 
   windows:
     runs-on: windows-latest
