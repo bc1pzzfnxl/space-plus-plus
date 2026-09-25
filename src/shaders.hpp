@@ -383,9 +383,10 @@ void main()
 {
   const float radius = length(a_position.xy);
   vec3 position = a_position;
-  // Rubber-sheet depression: z ~ -8M / (r + 2), sitting just below z = 0
-  // so the equatorial disk (ray-traced at z = 0) never z-fights with it.
-  position.z = -8.0 * u_mass / (radius + 2.0) - 0.02;
+  // Rubber-sheet depression: z ~ -70M / (r + 2) — a ~-35M funnel at the
+  // center, sitting just below z = 0 so the equatorial disk (ray-traced at
+  // z = 0) never z-fights with it.
+  position.z = -70.0 * u_mass / (radius + 2.0) - 0.02;
   v_radius = radius;
   vec4 clip = u_mvp * vec4(position, 1.0);
   // Same block snap as the ray tracer so the grid joins the retro look.
