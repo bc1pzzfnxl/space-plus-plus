@@ -26,8 +26,8 @@ jobs:
       - name: Smoke test (llvmpipe under xvfb)
         continue-on-error: true
         run: |
-          xvfb-run -a ./build/blackhole --frames 10 --anim --orbit 0 \
-            --pixel 4 --polish --screenshot smoke.bmp
+          xvfb-run -a -s "-screen 0 1280x720x24" ./build/blackhole --frames 10 \
+            --anim --orbit 0 --pixel 4 --polish --screenshot smoke.bmp
 
       - name: Upload smoke screenshot
         uses: actions/upload-artifact@v4
@@ -56,7 +56,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force pkg/shots | Out-Null
           Copy-Item build/Release/blackhole.exe pkg/
-          Copy-Item vcpkg_installed/x64-windows/bin/*.dll pkg/
+          Copy-Item build/vcpkg_installed/x64-windows/bin/*.dll pkg/
           Copy-Item README.md pkg/
           Copy-Item BUILD_WINDOWS.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath space-plus-plus-windows-x64.zip -Force

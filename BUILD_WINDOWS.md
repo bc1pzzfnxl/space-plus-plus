@@ -33,10 +33,12 @@ cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.c
 cmake --build build --config Release
 ```
 
-L'exécutable est dans `build\Release\blackhole.exe`. Copier à côté les DLL :
+L'exécutable est dans `build\Release\blackhole.exe`. Copier à côté les DLL
+(vcpkg installe dans `build\vcpkg_installed\` ; chercher `SDL2.dll` et
+`glew32.dll` sous `bin\` si le chemin diffère) :
 
 ```bat
-copy vcpkg_installed\x64-windows\bin\*.dll build\Release\
+copy build\vcpkg_installed\x64-windows\bin\*.dll build\Release\
 ```
 
 ## Checklist de test (GPU NVIDIA)
