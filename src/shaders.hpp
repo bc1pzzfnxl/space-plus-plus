@@ -1,6 +1,6 @@
 #pragma once
 
-// GLSL sources for the Schwarzschild ray tracer (embedded: no runtime asset paths).
+// GLSL sources for the Kerr ray tracer (embedded: no runtime asset paths).
 namespace shaders {
 
 inline constexpr const char* kRaytraceVertex = R"glsl(
@@ -33,6 +33,7 @@ uniform vec3 u_cam_up;
 uniform float u_tan_half_fov;
 uniform float u_aspect;
 uniform float u_mass;          // M in geometric units (G = c = 1)
+uniform float u_spin;          // dimensionless spin a* in [-0.95, 0.95]
 uniform float u_proj_near;
 uniform float u_proj_far;
 uniform float u_disk_inner;    // r_ISCO (6M for Schwarzschild)
@@ -45,10 +46,11 @@ uniform vec4 u_comet_trail[128];   // [i*8+k] xyz point, w = fade (0 = none)
 uniform vec2 u_resolution;         // framebuffer size [px]
 uniform float u_pixel;             // retro block size (1 = native, >1 snaps rays)
 
-const int k_max_steps = 600;
-const float k_dphi = 0.02;
+const int k_max_steps = 900;
+const float k_step_r = 0.30;   // max |dr| per Mino-time step
+const float k_step_th = 0.10;  // max |dtheta| per Mino-time step
+const float k_step_ph = 0.02;  // max |dphi| per Mino-time step
 const float k_r_escape = 50.0;
-const float k_epsilon = 1e-5;
 const float k_pi = 3.14159265358979;
 const int k_max_hits = 8;
 const float k_comet_sigma = 0.14;  // streak halo width [M]
@@ -159,68 +161,179 @@ void disk_emission(float r, float phi, float lambda, out vec3 color,
 }
 
 // ----------------------------------------------------------------------------
-// Null geodesics of the Schwarzschild metric.
+// Null geodesics of the Kerr metric (spec sections 2.2 and 3.2).
 //
-// In the photon orbital plane the radial equation reduces to (spec section 3):
-//     d^2u / dphi^2 + u = 3 M u^2,      u = 1 / r
-// integrated with classical RK4.
+// Carter's separated equations in Mino time dtau = dlambda / rho^2:
+//   (dr/dtau)^2 = R(r), (dtheta/dtau)^2 = Theta(theta)
+// integrated without square roots via the second-order forms
+//   d^2r/dtau^2 = R'(r)/2,  d^2theta/dtau^2 = Theta'(theta)/2
+// which stay sign-consistent through radial/polar turning points.
 // ----------------------------------------------------------------------------
-vec2 geodesic_deriv(vec2 state)
+struct KerrState {
+  float r;
+  float vr;
+  float th;
+  float vth;
+  float ph;
+};
+
+float kerr_a()
 {
-  return vec2(state.y, 3.0 * u_mass * state.x * state.x - state.x);
+  return u_spin * u_mass;
 }
 
-vec3 escape_direction(float u, float du, float phi, vec3 e1, vec3 e2)
+float kerr_delta(float r)
 {
-  const vec3 radial = cos(phi) * e1 + sin(phi) * e2;
-  const vec3 tangential = -sin(phi) * e1 + cos(phi) * e2;
-  return normalize((-du / (u * u)) * radial + (1.0 / u) * tangential);
+  const float a = kerr_a();
+  return r * r - 2.0 * u_mass * r + a * a;
+}
+
+float kerr_R(float r, float xi, float eta)
+{
+  const float a = kerr_a();
+  const float p = r * r + a * a - a * xi;
+  return p * p - kerr_delta(r) * (eta + (xi - a) * (xi - a));
+}
+
+float kerr_dR(float r, float xi, float eta)
+{
+  const float a = kerr_a();
+  const float p = r * r + a * a - a * xi;
+  const float q = eta + (xi - a) * (xi - a);
+  return 4.0 * r * p - (2.0 * r - 2.0 * u_mass) * q;
+}
+
+float kerr_T(float th, float xi, float eta)
+{
+  const float a = kerr_a();
+  const float c = cos(th);
+  const float s2 = max(sin(th) * sin(th), 1e-8);
+  return eta + a * a * c * c - xi * xi * c * c / s2;
+}
+
+float kerr_dT(float th, float xi, float eta)
+{
+  const float a = kerr_a();
+  const float c = cos(th);
+  const float s = max(sin(th), 1e-3);
+  return -2.0 * a * a * c * s + 2.0 * xi * xi * c / (s * s * s);
+}
+
+// Mino-time dphi/dtau for E = 1, Lz = xi. Verified against the metric
+// contraction rho^2 * g^{mu phi} p_mu (and dphi/dtau = rho^2 * U^phi):
+// xi/sin^2 - a + a(r^2+a^2-a xi)/Delta. Spec section 3.2's quoted
+// expression differs by +a.
+float kerr_dphi(float r, float th, float xi)
+{
+  const float a = kerr_a();
+  const float s = max(sin(th), 1e-3);
+  return (xi / (s * s) - a) +
+         a * (r * r + a * a - a * xi) / max(kerr_delta(r), 1e-6);
+}
+
+KerrState kerr_deriv(const KerrState s, float xi, float eta)
+{
+  KerrState d;
+  d.r = s.vr;
+  d.vr = 0.5 * kerr_dR(s.r, xi, eta);
+  d.th = s.vth;
+  d.vth = 0.5 * kerr_dT(s.th, xi, eta);
+  d.ph = kerr_dphi(s.r, s.th, xi);
+  return d;
+}
+
+KerrState kerr_scale(const KerrState s, float k)
+{
+  KerrState o;
+  o.r = s.r * k;
+  o.vr = s.vr * k;
+  o.th = s.th * k;
+  o.vth = s.vth * k;
+  o.ph = s.ph * k;
+  return o;
+}
+
+KerrState kerr_add(const KerrState p, const KerrState q)
+{
+  KerrState o;
+  o.r = p.r + q.r;
+  o.vr = p.vr + q.vr;
+  o.th = p.th + q.th;
+  o.vth = p.vth + q.vth;
+  o.ph = p.ph + q.ph;
+  return o;
+}
+
+vec3 bl_to_cart(float r, float th, float ph)
+{
+  const float a = kerr_a();
+  const float s = sqrt(r * r + a * a);
+  return vec3(s * sin(th) * cos(ph), s * sin(th) * sin(ph), r * cos(th));
 }
 
 vec3 trace_ray(vec3 dir, out float surface_distance)
 {
   surface_distance = u_proj_far;
-  const float r0 = length(u_cam_pos);
-  const vec3 e1 = u_cam_pos / r0;
-  const float cos_alpha = dot(dir, e1);
-  const vec3 tangential = dir - cos_alpha * e1;
-  const float sin_alpha = length(tangential);
+  const float M = u_mass;
+  const float a = kerr_a();
 
-  // Degenerate purely radial ray: no orbital plane to speak of.
-  if (sin_alpha < k_epsilon) {
-    return cos_alpha > 0.0 ? starfield(e1) : vec3(0.0);
-  }
-  const vec3 e2 = tangential / sin_alpha;
+  // Camera position in Boyer-Lindquist coordinates:
+  // z = r cos(theta), x^2 + y^2 = (r^2 + a^2) sin^2(theta).
+  const float rad2 = dot(u_cam_pos, u_cam_pos);
+  const float q = rad2 - a * a;
+  const float r0 =
+      sqrt(max(0.5 * (q + sqrt(q * q + 4.0 * a * a * u_cam_pos.z * u_cam_pos.z)),
+               1e-8));
+  const float ct = clamp(u_cam_pos.z / r0, -1.0, 1.0);
+  const float th0 = acos(ct);
+  const float ph0 = atan(u_cam_pos.y, u_cam_pos.x);
+  const float st = max(sin(th0), 1e-4);
+  const float cf = cos(ph0);
+  const float sf = sin(ph0);
 
-  float u = 1.0 / r0;
-  // Initial du/dphi from the null first integral (E = 1):
-  //   du/dphi = -cos(alpha) / (sin(alpha) * r0 * sqrt(1 - 2M/r0))
-  const float lapse = sqrt(max(1.0 - 2.0 * u_mass / r0, 1e-6));
-  float du = -cos_alpha / (sin_alpha * r0 * lapse);
+  // Chain rule BL -> Cartesian for the unit view direction.
+  const float big_s = sqrt(r0 * r0 + a * a);
+  const float sig = r0 * r0 + a * a * ct * ct;
+  const float cpar = dir.x * cf + dir.y * sf;
+  const float drt = big_s * (r0 * st * cpar + big_s * ct * dir.z) / sig;
+  const float dtht = (big_s * cpar * ct - r0 * st * dir.z) / sig;
+  const float dph = (-dir.x * sf + dir.y * cf) / (big_s * st);
 
-  // Conserved axial angular momentum ratio lambda = L_z / E (spec section 3).
-  // The traced ray runs camera -> disk, the physical photon runs disk ->
-  // camera: L_z flips sign under reversal while E stays positive, hence the
-  // crossed order below.
-  const float lambda = cross(dir, u_cam_pos).z / lapse;
+  // Metric coefficients at the camera + static-observer coframe components
+  // of the view direction (spec section 2.2).
+  const float del = max(kerr_delta(r0), 1e-8);
+  const float f = max(1.0 - 2.0 * M * r0 / sig, 1e-6);  // -g_tt
+  const float sin2 = st * st;
+  const float g_tphi = -2.0 * M * r0 * a * sin2 / sig;
+  const float gphiphi =
+      sin2 * (r0 * r0 + a * a + 2.0 * M * r0 * a * a * sin2 / sig);
+  const float h = gphiphi + g_tphi * g_tphi / f;
 
-  // Disk lies in the world z = 0 plane. The photon path z(phi) =
-  // (e1.z cos(phi) + e2.z sin(phi)) / u vanishes at phi_base + k*pi.
-  const float plane_a = e1.z;
-  const float plane_b = e2.z;
-  const bool has_crossings = (plane_a * plane_a + plane_b * plane_b) > 1e-8;
-  float next_cross = 0.0;
-  if (has_crossings) {
-    const float phi_base = atan(-plane_a, plane_b);
-    next_cross = phi_base + ceil(-phi_base / k_pi) * k_pi;
-  }
+  vec3 n = vec3(sqrt(sig / del) * drt, sqrt(sig) * dtht, sqrt(h) * dph);
+  const float nlen = length(n);
+  n = nlen > 1e-8 ? n / nlen : vec3(1.0, 0.0, 0.0);
+
+  // Conserved quantities of the traced branch (E = 1, future-directed along
+  // the view direction): Lz = g_tphi/f + n.z*sqrt(h)/sqrt(f). At a = 0 this
+  // is +cross(cam, dir).z / lapse, so phi advances along the traced path.
+  const float xi = g_tphi / f + n.z * sqrt(h) / sqrt(f);
+  const float eta =
+      sig * n.y * n.y / f - a * a * ct * ct + xi * xi * ct * ct / (st * st);
+
+  KerrState s;
+  s.r = r0;
+  s.th = th0;
+  s.ph = ph0;
+  s.vr = (n.x >= 0.0 ? 1.0 : -1.0) * sqrt(max(kerr_R(r0, xi, eta), 0.0));
+  s.vth = (n.y >= 0.0 ? 1.0 : -1.0) * sqrt(max(kerr_T(th0, xi, eta), 0.0));
+
+  const float r_plus = M + sqrt(max(M * M - a * a, 0.0));
 
   float hit_r[k_max_hits];
-  float hit_phi[k_max_hits];
+  float hit_ph[k_max_hits];
   int hit_count = 0;
-
-  float phi = 0.0;
   bool captured = false;
+  bool escaped = false;
 
   // Particle glow collected along the bent path: rays passing near a streak
   // glow, so the lensed primary/secondary images come out for free. Frozen
@@ -229,48 +342,73 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
   bool glow_frozen = false;
 
   for (int step = 0; step < k_max_steps; ++step) {
-    if (u >= 0.5 / u_mass) {
-      captured = true;  // crossed the event horizon r_s = 2M
+    if (s.r <= r_plus + 1e-4 * M) {
+      captured = true;
       break;
     }
-    if (u <= 1.0 / k_r_escape) {
-      break;  // escaped to r > 50 M: sample the starfield
+    if (s.r >= k_r_escape) {
+      escaped = true;
+      break;
     }
 
-    const float prev_phi = phi;
-    const float prev_u = u;
+    // Adaptive Mino step: cap motion in r/theta/phi AND the velocity change.
+    // R' and Theta' spike near the turning points; without the velocity caps
+    // the RK4 midpoint overshoots the turn, vr/vth explode, the ray fakes
+    // hundreds of pole reflections and floods fake disk hits (rib column).
+    const float rv = max(kerr_R(s.r, xi, eta), 0.0);
+    const float tv = max(kerr_T(s.th, xi, eta), 0.0);
+    const float fr = kerr_dphi(s.r, s.th, xi);
+    float dtau = min(k_step_r / max(sqrt(rv), 1e-4),
+                     k_step_th / max(sqrt(tv), 1e-4));
+    dtau = min(dtau,
+               0.2 * max(abs(s.vr), 0.2) /
+                   max(abs(kerr_dR(s.r, xi, eta)), 1.0));
+    dtau = min(dtau,
+               0.2 * max(abs(s.vth), 0.2) /
+                   max(abs(kerr_dT(s.th, xi, eta)), 1.0));
+    dtau = min(dtau, k_step_ph / max(abs(fr), 1e-4));
+    dtau = clamp(dtau, 1e-5, 0.05);
 
-    const vec2 state = vec2(u, du);
-    const vec2 k1 = geodesic_deriv(state);
-    const vec2 k2 = geodesic_deriv(state + 0.5 * k_dphi * k1);
-    const vec2 k3 = geodesic_deriv(state + 0.5 * k_dphi * k2);
-    const vec2 k4 = geodesic_deriv(state + k_dphi * k3);
-    const vec2 next = state + (k_dphi / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
-
-    phi += k_dphi;
-    u = next.x;
-    du = next.y;
+    const KerrState prev = s;
+    const KerrState k1 = kerr_deriv(s, xi, eta);
+    const KerrState k2 =
+        kerr_deriv(kerr_add(s, kerr_scale(k1, 0.5 * dtau)), xi, eta);
+    const KerrState k3 =
+        kerr_deriv(kerr_add(s, kerr_scale(k2, 0.5 * dtau)), xi, eta);
+    const KerrState k4 = kerr_deriv(kerr_add(s, kerr_scale(k3, dtau)), xi, eta);
+    s = kerr_add(
+        s, kerr_scale(kerr_add(k1, kerr_add(kerr_scale(k2, 2.0),
+                                            kerr_add(kerr_scale(k3, 2.0), k4))),
+                      dtau / 6.0));
+    // Polar crossing: in Boyer-Lindquist a path through the axis maps
+    // theta -> -theta (or 2pi - theta) with phi -> phi + pi.
+    if (s.th < 0.0) {
+      s.th = -s.th;
+      s.vth = -s.vth;
+      s.ph += k_pi;
+    } else if (s.th > k_pi) {
+      s.th = 2.0 * k_pi - s.th;
+      s.vth = -s.vth;
+      s.ph += k_pi;
+    }
 
     // Equatorial crossings inside this step (multiple disk images included).
-    while (has_crossings && next_cross <= phi && hit_count < k_max_hits) {
-      const float t = clamp((next_cross - prev_phi) / k_dphi, 0.0, 1.0);
-      const float u_hit = mix(prev_u, u, t);
-      if (u_hit < 0.5 / u_mass) {
-        const float r_hit = 1.0 / u_hit;
-        if (r_hit >= u_disk_inner && r_hit <= u_disk_outer) {
-          hit_r[hit_count] = r_hit;
-          hit_phi[hit_count] = next_cross;
-          ++hit_count;
-        }
+    if (cos(prev.th) * cos(s.th) < 0.0) {
+      const float t = clamp((0.5 * k_pi - prev.th) / (s.th - prev.th), 0.0, 1.0);
+      const float rh = mix(prev.r, s.r, t);
+      if (rh > r_plus && rh >= u_disk_inner && rh <= u_disk_outer &&
+          hit_count < k_max_hits) {
+        hit_r[hit_count] = rh;
+        hit_ph[hit_count] = mix(prev.ph, s.ph, t);
+        ++hit_count;
       }
-      next_cross += k_pi;
     }
 
     // Sample the particle streaks along the path. Must happen BEFORE the
     // freeze below: a particle on the disk plane crosses z = 0 at its own
     // position, so sampling after the freeze would always miss it.
     if (!glow_frozen) {
-      const vec3 p = (1.0 / u) * (cos(phi) * e1 + sin(phi) * e2);
+      const vec3 p = bl_to_cart(s.r, s.th, s.ph);
       for (int i = 0; i < 16; ++i) {
         const vec4 head = u_comet_head[i];
         if (head.w <= 0.0) {
@@ -285,17 +423,17 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
                 (exp(-d2 / (k_comet_sigma * k_comet_sigma)) * 0.7 +
                  exp(-d2 / (k_comet_core * k_comet_core)) * 2.5);
         for (int k = 0; k < 7; ++k) {
-          const vec4 a = u_comet_trail[i * 8 + k];
-          const vec4 b = u_comet_trail[i * 8 + k + 1];
-          if (a.w <= 0.0 || b.w <= 0.0) {
+          const vec4 a2 = u_comet_trail[i * 8 + k];
+          const vec4 b2 = u_comet_trail[i * 8 + k + 1];
+          if (a2.w <= 0.0 || b2.w <= 0.0) {
             break;  // trail shorter than this
           }
-          const vec3 ab = b.xyz - a.xyz;
-          const float t =
-              clamp(dot(p - a.xyz, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
-          const float dd = length(p - (a.xyz + t * ab));
+          const vec3 ab = b2.xyz - a2.xyz;
+          const float tt =
+              clamp(dot(p - a2.xyz, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+          const float dd = length(p - (a2.xyz + tt * ab));
           const float d = dd * dd;
-          glow += k_comet_color * a.w *
+          glow += k_comet_color * a2.w *
                   (exp(-d / (k_comet_sigma * k_comet_sigma)) * 0.7 +
                    exp(-d / (k_comet_core * k_comet_core)) * 2.0);
         }
@@ -308,17 +446,40 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     }
   }
 
+  // Step exhaustion fallback: resolve the ray one way or the other so it
+  // never renders as an undefined black dot.
+  if (!escaped && !captured) {
+    if (s.r > 10.0) {
+      escaped = true;
+    } else {
+      captured = true;
+    }
+  }
+
   vec3 background = vec3(0.0);
-  if (!captured && u <= 0.35 / u_mass) {
-    background = starfield(escape_direction(u, du, phi, e1, e2));
+  if (escaped) {
+    // Velocity in Boyer-Lindquist pushed forward to Cartesian coordinates.
+    const float esc_s = sqrt(s.r * s.r + a * a);
+    const float esc_st = max(sin(s.th), 1e-4);
+    const float esc_ct = cos(s.th);
+    const float esc_dph = kerr_dphi(s.r, s.th, xi);
+    const float dx = (s.r / esc_s) * esc_st * cos(s.ph) * s.vr +
+                     esc_s * esc_ct * cos(s.ph) * s.vth -
+                     esc_s * esc_st * sin(s.ph) * esc_dph;
+    const float dy = (s.r / esc_s) * esc_st * sin(s.ph) * s.vr +
+                     esc_s * esc_ct * sin(s.ph) * s.vth +
+                     esc_s * esc_st * cos(s.ph) * esc_dph;
+    const float dz = esc_ct * s.vr - s.r * esc_st * s.vth;
+    const float el = length(vec3(dx, dy, dz));
+    background = starfield(el > 1e-8 ? vec3(dx, dy, dz) / el : u_cam_fwd);
   }
 
   // Frontmost surface along this ray: first disk image, else the horizon.
   if (hit_count > 0) {
-    const vec3 p = hit_r[0] * (cos(hit_phi[0]) * e1 + sin(hit_phi[0]) * e2);
+    const vec3 p = bl_to_cart(hit_r[0], 0.5 * k_pi, hit_ph[0]);
     surface_distance = dot(p - u_cam_pos, u_cam_fwd);
   } else if (captured) {
-    const vec3 p = (1.0 / u) * (cos(phi) * e1 + sin(phi) * e2);
+    const vec3 p = bl_to_cart(s.r, s.th, s.ph);
     surface_distance = dot(p - u_cam_pos, u_cam_fwd);
   }
 
@@ -328,7 +489,9 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
   for (int i = hit_count - 1; i >= 0; --i) {
     vec3 emission;
     float alpha;
-    disk_emission(hit_r[i], hit_phi[i], lambda, emission, alpha);
+    // lambda for the g-factor is the arriving photon's Lz/E = -xi
+    // (the traced branch runs the same curve in the opposite direction).
+    disk_emission(hit_r[i], hit_ph[i], -xi, emission, alpha);
     color = mix(color, emission, alpha);
   }
   return color + glow;

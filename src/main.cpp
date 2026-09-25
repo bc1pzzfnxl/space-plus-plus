@@ -637,6 +637,7 @@ public:
     locations_.tan_half_fov = glGetUniformLocation(program_, "u_tan_half_fov");
     locations_.aspect = glGetUniformLocation(program_, "u_aspect");
     locations_.mass = glGetUniformLocation(program_, "u_mass");
+    locations_.spin = glGetUniformLocation(program_, "u_spin");
     locations_.proj_near = glGetUniformLocation(program_, "u_proj_near");
     locations_.proj_far = glGetUniformLocation(program_, "u_proj_far");
     locations_.disk_inner = glGetUniformLocation(program_, "u_disk_inner");
@@ -660,7 +661,8 @@ public:
   RaytracePass& operator=(const RaytracePass&) = delete;
 
   void draw(const Camera& camera, const DiskParams& disk, const CometSystem& comets,
-            int width, int height, float time_seconds, float pixel_size) const
+            int width, int height, float time_seconds, float pixel_size,
+            float spin) const
   {
     glViewport(0, 0, width, height);
     glUseProgram(program_);
@@ -678,6 +680,7 @@ public:
     glUniform1f(locations_.tan_half_fov, tan_half_fov);
     glUniform1f(locations_.aspect, static_cast<float>(width) / static_cast<float>(height));
     glUniform1f(locations_.mass, k_geometric_mass);
+    glUniform1f(locations_.spin, spin);
     glUniform1f(locations_.proj_near, k_projection_near);
     glUniform1f(locations_.proj_far, k_projection_far);
     glUniform1f(locations_.disk_inner, disk.inner_radius);
@@ -706,6 +709,7 @@ private:
     GLint tan_half_fov = -1;
     GLint aspect = -1;
     GLint mass = -1;
+    GLint spin = -1;
     GLint proj_near = -1;
     GLint proj_far = -1;
     GLint disk_inner = -1;
@@ -1010,6 +1014,7 @@ struct RunOptions {
   float pixel_size = 1.0F;          // retro block size (1 = native)
   bool polish = false;              // bloom + FXAA post chain
   float mass_solar = 1.0F;          // section-5 mass slider override
+  float spin = 0.0F;                // dimensionless Kerr spin a* [-0.95, 0.95]
 };
 
 // Parses CLI flags; exits via throw on bad input (E.2).
@@ -1042,11 +1047,13 @@ struct RunOptions {
       options.polish = true;
     } else if (arg == "--mass" && i + 1 < argc) {
       options.mass_solar = std::strtof(argv[++i], nullptr);
+    } else if (arg == "--spin" && i + 1 < argc) {
+      options.spin = std::strtof(argv[++i], nullptr);
     } else {
       throw std::invalid_argument{
           "usage: blackhole [--frames N] [--screenshot file.bmp] "
           "[--az degrees] [--orbit rad/s] [--anim] [--spawn N] [--click fx fy] "
-          "[--pixel [N]] [--polish] [--mass M_sun]"};
+          "[--pixel [N]] [--polish] [--mass M_sun] [--spin A]"};
     }
   }
   if (!options.screenshot_path.empty() && options.frame_limit < 0) {
@@ -1304,6 +1311,7 @@ int main(int argc, char* argv[])
     render_prefs.polish = options.polish;
     DiskParams disk;
     float hud_mass_solar = options.mass_solar;
+    float hud_spin = options.spin;
     CometSystem comets;
     if (options.animate) {
       comets.running = true;
@@ -1420,7 +1428,8 @@ int main(int argc, char* argv[])
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         raytrace_pass.draw(camera, disk, comets, drawable_width, drawable_height,
                            static_cast<float>(frame) / 60.0F * time_speed,
-                           render_prefs.pixel_size);
+                           render_prefs.pixel_size,
+                           std::clamp(hud_spin, -0.95F, 0.95F));
         grid_pass.draw(projection * view, drawable_width, drawable_height,
                        render_prefs.pixel_size, grid_mass);
         if (render_prefs.polish) {
