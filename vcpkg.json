@@ -1,0 +1,6 @@
+{
+  "name": "space-plus-plus",
+  "version-string": "0.1.0",
+  "description": "Space++ - black hole simulation sandbox",
+  "dependencies": ["sdl2", "glew", "glm"]
+}

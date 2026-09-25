@@ -1,0 +1,10 @@
+build/
+imgui.ini
+shots/*.bmp
+
+# local tooling / test artifacts
+.agents/
+.opencode/
+skills-lock.json
+shots/
+vcpkg_installed/
