@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1238,6 +1239,25 @@ int main(int argc, char* argv[])
 {
   try {
     RunOptions options = parse_options(argc, argv);
+#ifdef BLACKHOLE_DEFAULT_ARGS
+    // Build variant with baked-in flags (e.g. --polish --anim): used only
+    // when the user passes no arguments on the command line.
+    if (argc <= 1) {
+      std::istringstream preset{BLACKHOLE_DEFAULT_ARGS};
+      std::vector<std::string> args{"blackhole"};
+      std::string token;
+      while (preset >> token) {
+        args.push_back(token);
+      }
+      std::vector<char*> argv_preset;
+      argv_preset.reserve(args.size());
+      for (std::string& argument : args) {
+        argv_preset.push_back(argument.data());
+      }
+      options = parse_options(static_cast<int>(argv_preset.size()),
+                              argv_preset.data());
+    }
+#endif
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
       throw std::runtime_error{"SDL_Init failed: " + std::string{SDL_GetError()}};

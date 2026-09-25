@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build polish variant (--polish --anim)
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            "-DBLACKHOLE_DEFAULT_ARGS=--polish --anim"
+          cmake --build build --config Release
+          Copy-Item build/Release/blackhole.exe blackhole-polish-anim.exe
+
+      - name: Build pixel variant (--pixel --anim)
+        shell: pwsh
+        run: |
+          cmake -S . -B build "-DBLACKHOLE_DEFAULT_ARGS=--pixel --anim"
+          cmake --build build --config Release
+          Copy-Item build/Release/blackhole.exe blackhole-pixel-anim.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg/polish-anim, pkg/pixel-anim | Out-Null
+          Move-Item blackhole-polish-anim.exe pkg/polish-anim/
+          Move-Item blackhole-pixel-anim.exe pkg/pixel-anim/
+          Copy-Item build/vcpkg_installed/x64-windows/bin/*.dll pkg/polish-anim/
+          Copy-Item build/vcpkg_installed/x64-windows/bin/*.dll pkg/pixel-anim/
+          Copy-Item README.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath spaceplusplus-variants-win64.zip -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: spaceplusplus-variants-win64
+          path: spaceplusplus-variants-win64.zip

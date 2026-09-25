@@ -39,6 +39,13 @@ target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 target_link_libraries(imgui PUBLIC ${SDL2_LIBS})
 
 add_executable(blackhole src/main.cpp)
+# Optional preset: flags used when the app is launched without arguments,
+# e.g. -DBLACKHOLE_DEFAULT_ARGS="--polish --anim" (see README build variants).
+set(BLACKHOLE_DEFAULT_ARGS "" CACHE STRING "CLI flags used when none are given")
+if(BLACKHOLE_DEFAULT_ARGS)
+  target_compile_definitions(blackhole PRIVATE
+    BLACKHOLE_DEFAULT_ARGS="${BLACKHOLE_DEFAULT_ARGS}")
+endif()
 if(MSVC)
   target_compile_options(blackhole PRIVATE /W4)
 else()
