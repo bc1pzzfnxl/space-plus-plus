@@ -1,95 +1,141 @@
-# Space++ — Simulateur de trou noir (sandbox)
+# Space++ — Black Hole Simulation Sandbox
 
-[![build](https://github.com/bc1pzzfnxl/space-plus-plus/actions/workflows/build.yml/badge.svg)](https://github.com/bc1pzzfnxl/space-plus-plus/actions/workflows/build.yml)
+A real-time C++20 / OpenGL 4.6 sandbox: ray-traced Schwarzschild lensing
+(RK4), a luminous animated accretion disk (g-factor physics), a warped
+space-time grid, an orbiting particle swarm (timelike RK4 geodesics, ISCO
+capture), an orbiting camera, an ImGui settings panel with the thermodynamics
+HUD (spec section 5), retro block rendering and a polish pass (bloom + FXAA).
 
-Sandbox de simulation en C++20 / OpenGL 4.6 : lentilles de Schwarzschild tracées
-au rayon (RK4), disque d'accrétion lumineux et animé, grille d'espace-temps
-déformée, essaim de particules en orbite (géodésiques timelike RK4, capture
-ISCO), caméra orbite, panneau de paramètres ImGui (HUD thermodynamique §5 du
-cahier des charges), rendu rétro par blocs et polish (bloom + FXAA) — tout en
-temps réel, comme un banc d'essai physique.
+## Build on Linux
 
-## Dépendances (CachyOS / Arch)
+Dependencies (Arch / CachyOS):
 
 ```bash
 sudo pacman -S --needed cmake gcc sdl2 glew glm mesa
 ```
 
-- CMake ≥ 3.16, g++ (C++20), SDL2, GLEW, GLM, pilote OpenGL ≥ 4.6.
-- Dear ImGui est déjà vendorisé dans `third_party/imgui/` (aucun `git clone` nécessaire).
+On Debian / Ubuntu:
 
-## Windows / NVIDIA
+```bash
+sudo apt install cmake g++ libsdl2-dev libglew-dev libglm-dev
+```
 
-Build portable (CMake + vcpkg) et binaires prêts à l'emploi : voir
-[BUILD_WINDOWS.md](BUILD_WINDOWS.md). Chaque push compile aussi sous
-`windows-latest` et `ubuntu-24.04` via GitHub Actions (artefact zip dans
-l'onglet Actions).
-
-## Construction
+- CMake ≥ 3.20, a C++20 compiler, OpenGL ≥ 4.6 driver.
+- Dear ImGui is vendored in `third_party/imgui/` (no `git clone` needed).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-```
-
-## Lancer l'application
-
-```bash
 ./build/blackhole
 ```
 
-### Commandes à l'écran
+## Build on Windows
 
-| Action              | Contrôle                          |
-|---------------------|-----------------------------------|
-| Orbiter             | glisser avec le bouton gauche     |
-| Zoom                | molette                           |
-| Lancer une particule | clic droit (direction de la souris) |
-| Vues de caméra      | boutons **Side / 45 deg / Top**   |
-| Simulation          | **Play / Pause / Step / Reset**, vitesse x0.25–x4 |
-| Essaim (Swarm lab)  | population, top-up, rayon, excentricité, inclinaison |
-| Réglages disque/masse | panneaux **Settings** (gauche) et **Thermodynamics** (droite) |
-| Rendu               | section **Rendering** : pixel size (1–8 px), polish + bloom |
-| HUD thermodynamique | `r_s`, sphère de photons, ISCO, `T_Hawking`, entropie, `dM/dt`, temps d'évaporation |
-| Quitter             | `Échap` ou fermer la fenêtre      |
+Prerequisites:
 
-Le disque scintille en continu (texture azimutale cisaillée par la rotation
-Keplerienne — la physique g⁴ est inchangée). L'essaim est peuplé à 70 %
-d'orbites liées (précession relativiste) et 30 % de plongeuses ; une
-particule capturée est recyclée pour en garder la population stable.
+- **Visual Studio 2022** with the *Desktop development with C++* workload
+- CMake (ships with VS, or `winget install Kitware.CMake`)
+- [vcpkg](https://github.com/microsoft/vcpkg):
 
-### Options en ligne de commande
+```bat
+git clone https://github.com/microsoft/vcpkg C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+```
 
-| Option                | Effet                                              |
-|-----------------------|----------------------------------------------------|
-| `--frames N`          | quitte automatiquement après N images              |
-| `--screenshot f.bmp`  | enregistre la dernière image (nécessite `--frames`) |
-| `--az <degrés>`       | azimuth de départ de la caméra (test de vue)       |
-| `--orbit <rad/s>`     | vitesse d'orbite auto de la caméra (`0` = fixe)     |
-| `--anim`              | démarre l'horloge de l'essaim (particules en mouvement) |
-| `--spawn N`           | spawn supplémentaire de N particules au démarrage   |
-| `--click fx fy`       | lance une particule vers un point du viewport (fractions 0–1) |
-| `--pixel [N]`         | rendu par blocs de N×N px (défaut 4, `1` = natif)  |
-| `--polish`            | bloom (léger) + FXAA ; désactivé automatiquement en mode pixel |
+Build (SDL2 / GLEW / GLM install automatically via `vcpkg.json`):
 
-Exemple — rendu rétro polishé après 120 images :
+```bat
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake --build build --config Release
+```
+
+The executable is `build\Release\blackhole.exe`. Copy the DLLs next to it
+(vcpkg installs into `build\vcpkg_installed\`; look for `SDL2.dll` and
+`glew32.dll` under `bin\` if the path differs):
+
+```bat
+copy build\vcpkg_installed\x64-windows\bin\*.dll build\Release\
+build\Release\blackhole.exe --pixel --polish --anim
+```
+
+### NVIDIA checklist
+
+Run:
+
+```bat
+build\Release\blackhole.exe --frames 60 --anim --pixel --polish --screenshot shots\nvidia.bmp
+```
+
+1. The first terminal line must read
+   `OpenGL 4.6 (Core Profile) ... on NVIDIA GeForce ...`.
+   If it shows the CPU/Intel GPU, the laptop is on the iGPU — set
+   *NVIDIA Control Panel → Manage 3D settings → High-performance NVIDIA
+   processor*, or *Windows Settings → Graphics → blackhole.exe → High
+   performance*.
+2. The black shadow, disk, blue grid and cyan particles all render.
+3. **Settings → Rendering**: move *Pixel size* (immediate retro effect) and
+   toggle *Polish*.
+4. Resize the window: no black screen (FBOs are recreated).
+5. Right-click in the window: launches a particle toward the cursor.
+
+A recent Studio driver is recommended. OpenGL 4.6 is native on every NVIDIA
+GPU from Fermi onward on Windows. If the console flashes and closes, launch
+from `cmd.exe` to read the error.
+
+## On-screen controls
+
+| Action               | Control                             |
+|----------------------|-------------------------------------|
+| Orbit                | left mouse drag                     |
+| Zoom                 | mouse wheel                         |
+| Launch a particle    | right click (toward the cursor)     |
+| Camera views         | **Side / 45 deg / Top** buttons     |
+| Simulation           | **Play / Pause / Step / Reset**, speed x0.25–x4 |
+| Swarm lab            | population, top-up interval, spawn radius, eccentricity, inclination |
+| Disk / mass          | **Settings** (left) and **Thermodynamics** (right) panels |
+| Rendering            | **Rendering** section: pixel size (1–8 px), polish + bloom |
+| Thermodynamics HUD   | `r_s`, photon sphere, ISCO, `T_Hawking`, entropy, `dM/dt`, evaporation time |
+| Quit                 | `Esc` or close the window           |
+
+The disk shimmers continuously (azimuthal texture sheared by Keplerian
+rotation — the g⁴ physics is unchanged). The swarm is 70 % bound orbits
+(relativistic precession) and 30 % plungers; a captured particle is recycled
+so the population stays stable.
+
+### Command-line options
+
+| Option               | Effect                                                   |
+|----------------------|----------------------------------------------------------|
+| `--frames N`         | exit automatically after N frames                        |
+| `--screenshot f.bmp` | save the last frame (requires `--frames`)                |
+| `--az <degrees>`     | starting camera azimuth (view testing)                   |
+| `--orbit <rad/s>`    | camera auto-orbit speed (`0` = static)                   |
+| `--anim`             | start the swarm clock (particles move)                   |
+| `--spawn N`          | spawn N extra particles at startup                       |
+| `--click fx fy`      | launch a particle toward a viewport point (fractions 0–1)|
+| `--pixel [N]`        | N×N pixel block rendering (default 4, `1` = native)      |
+| `--polish`           | light bloom + FXAA; FXAA turns off automatically in pixel mode |
+
+Example — polished retro render after 120 frames:
 
 ```bash
 ./build/blackhole --pixel --polish --anim --frames 120 --screenshot shots/capture.bmp
 ```
 
-Les `.bmp` se convertissent en PNG avec ImageMagick :
+Screenshots convert to PNG with ImageMagick:
 
 ```bash
 magick shots/capture.bmp shots/capture.png
 ```
 
-## Structure
+## Project layout
 
 ```
-CMakeLists.txt        build (C++20, SDL2/GLEW/OpenGL, lib statique imgui)
-src/main.cpp          fenêtre, passes de rendu (raytrace/grille/post), essaim, orbite, panneau ImGui, HUD §5
-src/shaders.hpp       GLSL embarqués (géodésiques RK4, disque, grille, blur/FXAA)
-third_party/imgui/    Dear ImGui vendorisé
-shots/                captures de vérification
+CMakeLists.txt        build (C++20, SDL2/GLEW/OpenGL, static imgui lib)
+src/main.cpp          window, render passes (raytrace/grid/post), swarm,
+                      camera orbit, ImGui panel, HUD §5
+src/shaders.hpp       embedded GLSL (RK4 geodesics, disk, grid, blur/FXAA)
+vcpkg.json            Windows dependencies (sdl2, glew, glm)
+third_party/imgui/    vendored Dear ImGui
+shots/                verification captures
 ```
