@@ -115,13 +115,27 @@ private:
   static constexpr glm::vec3 k_world_up{0.0F, 0.0F, 1.0F};
 };
 
-// Accretion disk parameters (spec section 4): inner edge at the ISCO (6M).
+// Accretion disk parameters (spec section 4): inner edge defaults to the
+// Schwarzschild ISCO (6M); spin overrides it with kerr_isco.
 struct DiskParams {
   float inner_radius = 6.0F;
   float outer_radius = 16.0F;
   float peak_temperature = 5200.0F;
   float brightness = 1.2F;
 };
+
+// Kerr ISCO (spec section 2.2); sign(a) selects the co-rotating family
+// (r = 6M at a = 0, ~2.32M at a* = 0.9, ~8.72M retrograde at a* = -0.9).
+[[nodiscard]] float kerr_isco(float a)
+{
+  a = std::clamp(a, -0.998F, 0.998F);
+  const float z1 = 1.0F + std::cbrt(1.0F - a * a) *
+                               (std::cbrt(1.0F + a) + std::cbrt(1.0F - a));
+  const float z2 = std::sqrt(3.0F * a * a + z1 * z1);
+  const float root =
+      std::sqrt(std::max((3.0F - z1) * (3.0F + z1 + 2.0F * z2), 0.0F));
+  return 3.0F + z2 - (a >= 0.0F ? root : -root);
+}
 
 // Mouse-driven spherical orbit, mapped onto a Camera every frame.
 struct OrbitState {
@@ -1171,7 +1185,7 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   }
   ImGui::Separator();
   ImGui::TextUnformatted("Accretion disk");
-  ImGui::SliderFloat("Inner radius", &disk.inner_radius, 2.0F, 10.0F, "%.1f M");
+  ImGui::SliderFloat("Inner radius", &disk.inner_radius, 1.0F, 10.0F, "%.1f M");
   ImGui::SliderFloat("Outer radius", &disk.outer_radius, disk.inner_radius + 1.0F,
                      40.0F, "%.1f M");
   ImGui::SliderFloat("Peak temperature", &disk.peak_temperature, 1000.0F,
@@ -1312,6 +1326,7 @@ int main(int argc, char* argv[])
     DiskParams disk;
     float hud_mass_solar = options.mass_solar;
     float hud_spin = options.spin;
+    disk.inner_radius = kerr_isco(std::clamp(hud_spin, -0.95F, 0.95F));
     CometSystem comets;
     if (options.animate) {
       comets.running = true;

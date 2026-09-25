@@ -119,6 +119,8 @@ vec3 blackbody(float kelvin)
 // frequency shift; bolometric intensity scales as g^4 (Liouville).
 // lambda = L_z / E is the conserved axial angular momentum ratio.
 // ----------------------------------------------------------------------------
+float kerr_a();  // defined with the Kerr tracer below
+
 void disk_emission(float r, float phi, float lambda, out vec3 color,
                    out float alpha)
 {
@@ -130,12 +132,19 @@ void disk_emission(float r, float phi, float lambda, out vec3 color,
   const float flux_peak = 0.0566;
   const float flux = clamp(flux_shape / flux_peak, 0.0, 1.0);
 
-  // Keplerian angular velocity (a = 0), spec 4.1.
-  const float omega = 1.0 / pow(r, 1.5);
+  // Kerr equatorial circular-orbit angular velocity, spec 4.1:
+  // Omega_K = 1 / (r^{3/2} + a); reduces to Keplerian at a = 0.
+  const float a = kerr_a();
+  const float omega = 1.0 / (pow(r, 1.5) + a);
 
-  // Fluid 4-velocity normalization, spec 4.1 (g_tphi = 0 for Schwarzschild).
+  // Fluid 4-velocity normalization, spec 4.1, equatorial metric components
+  // (sin(theta) = 1): u_e^t = 1 / sqrt(-(g_tt + 2*Omega*g_tphi
+  // + Omega^2*g_phiphi)); g_tphi = 0 recovers the Schwarzschild form.
+  const float gtt = -(1.0 - 2.0 * u_mass / r);
+  const float gtph = -2.0 * u_mass * a / r;
+  const float gpp = r * r + a * a + 2.0 * u_mass * a * a / r;
   const float u_emit_t =
-      1.0 / sqrt(max(1.0 - 2.0 * u_mass / r - omega * omega * r * r, 1e-6));
+      1.0 / sqrt(max(-(gtt + 2.0 * omega * gtph + omega * omega * gpp), 1e-6));
   const float r_cam = length(u_cam_pos);
   const float u_obs_t = 1.0 / sqrt(max(1.0 - 2.0 * u_mass / r_cam, 1e-6));
 
