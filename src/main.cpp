@@ -1150,7 +1150,8 @@ struct RenderPrefs {
 
 // English control panel (spec section 3): camera, disk, animation, thermodynamics.
 void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
-                      CometSystem& comets, RenderPrefs& render_prefs)
+                      CometSystem& comets, RenderPrefs& render_prefs,
+                      float& spin)
 {
   const float azimuth_max = static_cast<float>(physics::k_pi);
 
@@ -1185,6 +1186,9 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   }
   ImGui::Separator();
   ImGui::TextUnformatted("Accretion disk");
+  if (ImGui::SliderFloat("Spin a*", &spin, -0.95F, 0.95F, "%.2f")) {
+    disk.inner_radius = kerr_isco(spin);
+  }
   ImGui::SliderFloat("Inner radius", &disk.inner_radius, 1.0F, 10.0F, "%.1f M");
   ImGui::SliderFloat("Outer radius", &disk.outer_radius, disk.inner_radius + 1.0F,
                      40.0F, "%.1f M");
@@ -1229,6 +1233,11 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   ImGui::TextDisabled("70%% bound orbits / 30%% plungers; captured slots respawn");
   ImGui::Separator();
   ImGui::TextUnformatted("Rendering");
+  const ImGuiIO& render_io = ImGui::GetIO();
+  if (render_io.Framerate > 0.0F) {
+    ImGui::Text("%.1f ms  (%.0f fps)", 1000.0F / render_io.Framerate,
+                render_io.Framerate);
+  }
   ImGui::SliderFloat("Pixel size", &render_prefs.pixel_size, 1.0F, 8.0F,
                      "%.0f px");
   ImGui::Checkbox("Polish (bloom + FXAA)", &render_prefs.polish);
@@ -1249,7 +1258,11 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
               physics::schwarzschild_radius(mass_solar));
   ImGui::Text("Photon sphere: %.5g m",
               1.5 * physics::schwarzschild_radius(mass_solar));
-  ImGui::Text("ISCO: %.5g m", 3.0 * physics::schwarzschild_radius(mass_solar));
+  const float rs = physics::schwarzschild_radius(mass_solar);
+  const float r_plus = 0.5F * rs * (1.0F + std::sqrt(std::max(1.0F - spin * spin, 0.0F)));
+  ImGui::Text("Horizon r+: %.5g m", r_plus);
+  ImGui::Text("Ergoregion (eq.): %.5g m", rs - r_plus);
+  ImGui::Text("ISCO: %.5g m", 0.5F * rs * kerr_isco(spin));
   ImGui::Text("Hawking temperature: %.5g K",
               physics::hawking_temperature(mass_solar));
   ImGui::Text("Entropy: %.5g k_B", physics::bh_entropy_over_kb(mass_solar));
@@ -1421,7 +1434,8 @@ int main(int argc, char* argv[])
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        draw_settings_ui(orbit, disk, hud_mass_solar, comets, render_prefs);
+        draw_settings_ui(orbit, disk, hud_mass_solar, comets, render_prefs,
+                         hud_spin);
 
         // Spec section 5 mass slider now drives the scene: heavier = deeper
         // rubber-sheet funnel (compressed M^0.25) and slower orbital clocks
