@@ -1,10 +1,30 @@
 # Space++ — Black Hole Simulation Sandbox
 
-A real-time C++20 / OpenGL 4.6 sandbox: ray-traced Schwarzschild lensing
-(RK4), a luminous animated accretion disk (g-factor physics), a warped
-space-time grid, an orbiting particle swarm (timelike RK4 geodesics, ISCO
-capture), an orbiting camera, an ImGui settings panel with the thermodynamics
-HUD (spec section 5), retro block rendering and a polish pass (bloom + FXAA).
+A real-time C++20 / OpenGL 4.6 sandbox: ray-traced **Kerr** lensing
+(Carter constants, Boyer–Lindquist coordinates, Mino-time RK4; exact
+Schwarzschild limit at `a* = 0`), a luminous animated accretion disk
+(g-factor physics, Shakura–Sunyaev profile, plunging-region emission),
+polar jets, an ergosphere glow, a warped space-time grid, an orbiting
+particle swarm (timelike RK4 geodesics, ISCO capture), an orbiting camera,
+an ImGui settings panel with the thermodynamics HUD (spec section 5),
+retro block rendering and a polish pass (bloom + FXAA).
+
+## Kerr physics
+
+- Geodesics integrate Carter's separated equations in Mino time
+  `dτ = dλ/ρ²` with velocity-capped RK4; `ξ`, `η` constants of motion and
+  the exact `dφ/dτ = ξ/sin²θ − a + a(r²+a²−aξ)/Δ` law (metric contraction
+  verified against `ρ²·g^{μφ}p_μ`).
+- Disk emission uses `Ω_K = 1/(r^{3/2}+a)`, the full equatorial
+  `g_tφ` fluid 4-velocity (spec §4.1) and the arriving photon's
+  `λ = −ξ` in the g-factor; `I ∝ g⁴ I_e`.
+- Inner edge follows the Kerr ISCO (spec §2.2, co-rotating family:
+  6 M at `a*=0`, 2.32 M at `+0.9`, 8.72 M at `−0.9`).
+- Realism toggles (Settings → Realism): plunging-region emission,
+  polar jets with advected knots, ergosphere piercing glow (escaped rays
+  only), disk turbulence.
+- Thermo HUD adds the Kerr horizon `r₊`, the equatorial ergoregion width
+  and the Kerr ISCO on top of the Schwarzschild rows.
 
 ## Build on Linux
 
@@ -93,8 +113,10 @@ from `cmd.exe` to read the error.
 | Simulation           | **Play / Pause / Step / Reset**, speed x0.25–x4 |
 | Swarm lab            | population, top-up interval, spawn radius, eccentricity, inclination |
 | Disk / mass          | **Settings** (left) and **Thermodynamics** (right) panels |
-| Rendering            | **Rendering** section: pixel size (1–8 px), polish + bloom |
-| Thermodynamics HUD   | `r_s`, photon sphere, ISCO, `T_Hawking`, entropy, `dM/dt`, evaporation time |
+| Spin `a*`            | **Settings → Accretion disk** (−0.95…+0.95, ISCO edge follows) |
+| Realism              | **Settings → Realism**: plunge, jets, ergosphere, turbulence |
+| Rendering            | **Rendering** section: frame time, pixel size (1–8 px), polish + bloom |
+| Thermodynamics HUD   | `r_s`, photon sphere, `r₊`, ergoregion, ISCO, `T_Hawking`, entropy, `dM/dt`, evaporation time |
 | Quit                 | `Esc` or close the window           |
 
 The disk shimmers continuously (azimuthal texture sheared by Keplerian
@@ -115,6 +137,8 @@ so the population stays stable.
 | `--click fx fy`      | launch a particle toward a viewport point (fractions 0–1)|
 | `--pixel [N]`        | N×N pixel block rendering (default 4, `1` = native)      |
 | `--polish`           | light bloom + FXAA; FXAA turns off automatically in pixel mode |
+| `--spin <a*>`        | initial dimensionless spin (−0.95…+0.95)                 |
+| `--mass <M_sun>`     | initial mass (grid depth ∝ M^0.25, Kepler clock ∝ 1/√M)  |
 
 Example — polished retro render after 120 frames:
 
@@ -133,8 +157,9 @@ magick shots/capture.bmp shots/capture.png
 ```
 CMakeLists.txt        build (C++20, SDL2/GLEW/OpenGL, static imgui lib)
 src/main.cpp          window, render passes (raytrace/grid/post), swarm,
-                      camera orbit, ImGui panel, HUD §5
-src/shaders.hpp       embedded GLSL (RK4 geodesics, disk, grid, blur/FXAA)
+                      camera orbit, ImGui panel, HUD §5, Kerr ISCO helper
+src/shaders.hpp       embedded GLSL (Kerr geodesics, disk emission, jets,
+                      ergosphere, grid, blur/FXAA)
 vcpkg.json            Windows dependencies (sdl2, glew, glm)
 third_party/imgui/    vendored Dear ImGui
 shots/                verification captures
