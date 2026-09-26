@@ -43,11 +43,25 @@ uniform float u_disk_brightness;   // exposure of the emitted flux
 uniform float u_time;              // scene clock [s]: churns the disk texture
 uniform vec4 u_comet_head[16];     // xyz world position, w = intensity (0 = dead)
 uniform vec4 u_comet_trail[128];   // [i*8+k] xyz point, w = fade (0 = none)
+const int k_star_slots = 3;        // concurrent TDE stars (matches CPU side)
+const int k_star_trail = 6;        // history points per star
+uniform vec4 u_star_pos_radius[k_star_slots];    // xyz ball, w = radius (0 = off)
+uniform vec4 u_star_axis_stretch[k_star_slots];  // xyz spaghett. axis, w = stretch
+uniform vec4 u_star_color[k_star_slots];         // rgb tint, w = intensity
+uniform vec4 u_star_trail[k_star_slots * k_star_trail];  // [s*6+k] point, w = fade
+uniform vec2 u_impact[k_star_slots];             // x = disrupt radius, y = heat
 uniform vec2 u_resolution;         // framebuffer size [px]
 uniform float u_pixel;             // retro block size (1 = native, >1 snaps rays)
 uniform vec4 u_realism;            // x = plunge, y = jets, z = ergo, w = turbulence
 
-const int k_max_steps = 900;
+const int k_max_steps = 600;  // capped: rays past this are near-trapped photon
+                              // orbits; the escape/capture fallback below
+                              // resolves them either way
+const int k_glow_stride = 4;  // particle glow sampled every Nth step (the halo
+                              // is spatially smooth); contributions scaled by N.
+                              // Debris-only world: the few live streaks cost
+                              // little even at full rate; stride keeps events
+                              // from tanking the frame.
 const float k_step_r = 0.30;   // max |dr| per Mino-time step
 const float k_step_th = 0.10;  // max |dtheta| per Mino-time step
 const float k_step_ph = 0.02;  // max |dphi| per Mino-time step
@@ -89,10 +103,13 @@ vec3 starfield(vec3 dir)
 
 // ----------------------------------------------------------------------------
 // Blackbody radiation color (Planck locus approximation, Tanner Helland fit).
+// Valid deep into the blue: the power-law branches extrapolate cleanly, so
+// true Novikov-Thorne peak temperatures (1e5..1e7 K, physical-colors mode)
+// render blue-white without NaNs.
 // ----------------------------------------------------------------------------
 vec3 blackbody(float kelvin)
 {
-  const float t = clamp(kelvin, 1000.0, 15000.0) / 100.0;
+  const float t = clamp(kelvin, 1000.0, 1.0e8) / 100.0;
   float red;
   float green;
   float blue;
@@ -114,6 +131,29 @@ vec3 blackbody(float kelvin)
 }
 
 // ----------------------------------------------------------------------------
+// Phenomenological disk turbulence: 3-octave value noise advected by the
+// Keplerian flow (the pattern corotates, so inner rings shear past outer
+// ones). Not GRMHD — a visual stand-in with the right differential shear.
+// ----------------------------------------------------------------------------
+float turb_hash(vec2 p)
+{
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+float turb_noise(vec2 p)
+{
+  const vec2 i = floor(p);
+  const vec2 f = fract(p);
+  const vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(turb_hash(i), turb_hash(i + vec2(1.0, 0.0)), u.x),
+             mix(turb_hash(i + vec2(0.0, 1.0)), turb_hash(i + vec2(1.0, 1.0)),
+                 u.x),
+             u.y);
+}
+
+// ----------------------------------------------------------------------------
 // Accretion disk emission (spec sections 4.1-4.2).
 //
 // g = (u^t_obs) / (u^t_emit * (1 - Omega * lambda)) is the relativistic
@@ -122,8 +162,8 @@ vec3 blackbody(float kelvin)
 // ----------------------------------------------------------------------------
 float kerr_a();  // defined with the Kerr tracer below
 
-void disk_emission(float r, float phi, float lambda, out vec3 color,
-                   out float alpha)
+void disk_emission(float r, float phi, float lambda, float mu,
+                   out vec3 color, out float alpha)
 {
   const float x = u_disk_inner / r;
 
@@ -163,19 +203,33 @@ void disk_emission(float r, float phi, float lambda, out vec3 color,
   const float g = clamp(u_obs_t / (u_emit_t * (1.0 - omega * lambda)), 0.05, 5.0);
 
   const float temperature = u_disk_temperature * pow(flux, 0.25);
-  // Intrinsic azimuthal turbulence advected by the Keplerian angular
-  // velocity: inner rings sweep faster than outer ones, so the pattern
-  // shears and the disk visibly spins (sandbox liveliness, texture only -
-  // the g^4 physics above is untouched).
-  const float advected = phi - omega * u_time * 6.0;
+  // Corotating turbulent pattern: phase = phi - Omega*t with t in geometric
+  // units, so the texture shears at the true Keplerian rate (the g^4 physics
+  // above is untouched). Sampled in (cos, sin) space: no azimuth seam.
+  const float advected = phi - omega * u_time;
   float shimmer = 1.0;
   if (u_realism.w > 0.5) {
-    shimmer = 1.0 + 0.12 * sin(6.0 * advected) +
-              0.08 * sin(11.0 * advected - 14.0 * r);
+    const vec2 tp = vec2(cos(advected), sin(advected)) * (1.5 + r * 0.35);
+    const float n = turb_noise(tp * 1.7) * 0.6 +
+                    turb_noise(tp * 3.7 + 13.1) * 0.3 +
+                    turb_noise(tp * 7.9 + 71.7) * 0.15;
+    shimmer = 0.72 + 0.55 * n;
   }
 
   color = blackbody(g * temperature) * pow(g, 4.0) * flux *
           u_disk_brightness * shimmer;
+  // Eddington limb darkening: face-on (mu = 1) renders full brightness,
+  // grazing rays dim toward 0.4x. mu comes from the crossing segment slope.
+  color *= (1.0 + 1.5 * clamp(mu, 0.0, 1.0)) / 2.5;
+  // TDE heating flashes: localized bumps around each disruption radius,
+  // decaying on the CPU side (strength -> 0, skipped entirely when cold).
+  for (int s = 0; s < k_star_slots; ++s) {
+    if (u_impact[s].y <= 0.01) {
+      continue;
+    }
+    const float du = (r - u_impact[s].x) * 0.5;
+    color *= 1.0 + u_impact[s].y * exp(-du * du);
+  }
 
   const float fade = 1.5;
   float alpha_in = smoothstep(u_disk_inner, u_disk_inner + 0.6, r);
@@ -356,6 +410,7 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
 
   float hit_r[k_max_hits];
   float hit_ph[k_max_hits];
+  float hit_mu[k_max_hits];  // incidence cosine at the crossing (limb dark.)
   int hit_count = 0;
   bool captured = false;
   bool escaped = false;
@@ -373,7 +428,10 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
       captured = true;
       break;
     }
-    if (s.r >= k_r_escape) {
+    // Escape only when outside AND moving outward: the camera itself may sit
+    // beyond k_r_escape (zoom-out), and rays aimed at the hole must still
+    // integrate inward instead of dying on step 0.
+    if (s.r >= k_r_escape && s.vr > 0.0) {
       escaped = true;
       break;
     }
@@ -382,10 +440,14 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     // R' and Theta' spike near the turning points; without the velocity caps
     // the RK4 midpoint overshoots the turn, vr/vth explode, the ray fakes
     // hundreds of pole reflections and floods fake disk hits (rib column).
+    // Far field: the radial cap scales with r (2 % per step) so rays from a
+    // distant camera cross the weak field without exhausting the budget;
+    // near the hole the 0.3 M cap still rules (accuracy where it matters).
     const float rv = max(kerr_R(s.r, xi, eta), 0.0);
     const float tv = max(kerr_T(s.th, xi, eta), 0.0);
     const float fr = kerr_dphi(s.r, s.th, xi);
-    float dtau = min(k_step_r / max(sqrt(rv), 1e-4),
+    const float step_r = max(k_step_r, 0.02 * s.r);
+    float dtau = min(step_r / max(sqrt(rv), 1e-4),
                      k_step_th / max(sqrt(tv), 1e-4));
     dtau = min(dtau,
                0.2 * max(abs(s.vr), 0.2) /
@@ -432,6 +494,8 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     }
 
     // Polar jets: soft cone along the rotation axis with advected knots.
+    // Decorative clock (jets are not physical here): kept at the historical
+    // visual speed, rescaled for the geometric time unit (4M per frame).
     if (u_realism.y > 0.5) {
       const float zj = abs(s.r * cos(s.th));
       const float rho = s.r * sin(s.th);
@@ -440,21 +504,41 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
         const float core = pow(1.0 - rho / wid, 2.0);
         const float axial = smoothstep(1.5, 4.0, zj) *
                             (1.0 - smoothstep(30.0, 45.0, zj));
-        const float knots = 0.7 + 0.3 * sin(2.5 * zj - u_time * 6.0);
+        const float knots = 0.7 + 0.3 * sin(2.5 * zj - u_time * 0.025);
         jet += vec3(0.45, 0.65, 1.0) * core * axial * knots *
                min(dtau, 0.05) * 2.5;
       }
     }
 
-    // Equatorial crossings inside this step (multiple disk images included).
-    if (cos(prev.th) * cos(s.th) < 0.0) {
-      const float t = clamp((0.5 * k_pi - prev.th) / (s.th - prev.th), 0.0, 1.0);
+    // Disk slab crossings: the disk has a flared half-thickness H(r) = 0.1 r
+    // (puffed silhouette instead of a razor plane). One hit per traversal,
+    // recorded at the slab ENTRY and merged with a same-step midplane
+    // crossing; a step jumping the whole slab falls back to the midplane
+    // point. A full traversal later also logs its midplane hit, so the
+    // sightline integral is sampled twice — brighter, as a slab should be.
+    // mu is the true incidence cosine from the Cartesian crossing segment.
+    const float zp = prev.r * cos(prev.th);
+    const float zc = s.r * cos(s.th);
+    const float fp = abs(zp) - 0.1 * prev.r;
+    const float fc = abs(zc) - 0.1 * s.r;
+    const bool entered = (fp > 0.0 && fc <= 0.0);
+    const bool midplane = (cos(prev.th) * cos(s.th) < 0.0);
+    if ((entered || midplane) && hit_count < k_max_hits) {
+      float t = 0.0;
+      if (entered && !midplane) {
+        t = clamp(fp / (fp - fc), 0.0, 1.0);
+      } else {
+        t = clamp((0.5 * k_pi - prev.th) / (s.th - prev.th), 0.0, 1.0);
+      }
       const float rh = mix(prev.r, s.r, t);
       const float r_floor = u_realism.x > 0.5 ? r_plus + 1e-3 * M : u_disk_inner;
-      if (rh > r_plus && rh >= r_floor && rh <= u_disk_outer &&
-          hit_count < k_max_hits) {
+      if (rh > r_plus && rh >= r_floor && rh <= u_disk_outer) {
         hit_r[hit_count] = rh;
         hit_ph[hit_count] = mix(prev.ph, s.ph, t);
+        const vec3 pc = bl_to_cart(prev.r, prev.th, prev.ph);
+        const vec3 qc = bl_to_cart(s.r, s.th, s.ph);
+        hit_mu[hit_count] =
+            clamp(abs(qc.z - pc.z) / max(length(qc - pc), 1e-6), 0.0, 1.0);
         ++hit_count;
       }
     }
@@ -462,7 +546,12 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     // Sample the particle streaks along the path. Must happen BEFORE the
     // freeze below: a particle on the disk plane crosses z = 0 at its own
     // position, so sampling after the freeze would always miss it.
-    if (!glow_frozen) {
+    // Perf: strided sampling (glow_gain compensates) + distance-gated
+    // falloff — beyond 0.5M both terms are < 3e-6 (invisible after the
+    // tonemapper), so the exp() pair is skipped entirely; the bright core
+    // only matters inside 0.18M.
+    if (!glow_frozen && (step % k_glow_stride) == 0) {
+      const float glow_gain = float(k_glow_stride);
       const vec3 p = bl_to_cart(s.r, s.th, s.ph);
       for (int i = 0; i < 16; ++i) {
         const vec4 head = u_comet_head[i];
@@ -471,13 +560,16 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
         }
         const vec3 dh = p - head.xyz;
         const float d2 = dot(dh, dh);
-        if (d2 > 100.0) {
-          continue;  // farther than 10M: no glow possible
+        if (d2 < 0.25) {
+          glow += k_comet_color * head.w * glow_gain *
+                  exp(-d2 / (k_comet_sigma * k_comet_sigma)) * 0.7;
+          if (d2 < 0.0324) {
+            glow += k_comet_color * head.w * glow_gain *
+                    exp(-d2 / (k_comet_core * k_comet_core)) * 2.5;
+          }
         }
-        glow += k_comet_color * head.w *
-                (exp(-d2 / (k_comet_sigma * k_comet_sigma)) * 0.7 +
-                 exp(-d2 / (k_comet_core * k_comet_core)) * 2.5);
-        for (int k = 0; k < 7; ++k) {
+        // Trail: newest 4 segments only (the bright head of the streak).
+        for (int k = 0; k < 4; ++k) {
           const vec4 a2 = u_comet_trail[i * 8 + k];
           const vec4 b2 = u_comet_trail[i * 8 + k + 1];
           if (a2.w <= 0.0 || b2.w <= 0.0) {
@@ -486,11 +578,47 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
           const vec3 ab = b2.xyz - a2.xyz;
           const float tt =
               clamp(dot(p - a2.xyz, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
-          const float dd = length(p - (a2.xyz + tt * ab));
-          const float d = dd * dd;
-          glow += k_comet_color * a2.w *
-                  (exp(-d / (k_comet_sigma * k_comet_sigma)) * 0.7 +
-                   exp(-d / (k_comet_core * k_comet_core)) * 2.0);
+          const vec3 rel = p - (a2.xyz + tt * ab);
+          const float d = dot(rel, rel);
+          if (d < 0.25) {
+            glow += k_comet_color * a2.w * glow_gain *
+                    exp(-d / (k_comet_sigma * k_comet_sigma)) * 0.7;
+            if (d < 0.0324) {
+              glow += k_comet_color * a2.w * glow_gain *
+                      exp(-d / (k_comet_core * k_comet_core)) * 2.0;
+            }
+          }
+        }
+      }
+      // TDE stars: soft balls, spaghettified along their velocity axes.
+      // Distance-gated like the comets: one exp only when near.
+      for (int s = 0; s < k_star_slots; ++s) {
+        if (u_star_pos_radius[s].w <= 0.0) {
+          continue;  // dormant slot
+        }
+        const vec3 dp = p - u_star_pos_radius[s].xyz;
+        const float along = dot(dp, u_star_axis_stretch[s].xyz);
+        const vec3 perp = dp - along * u_star_axis_stretch[s].xyz;
+        const float st = max(u_star_axis_stretch[s].w, 1.0);
+        const float ds = dot(perp, perp) + along * along / (st * st);
+        const float sr = u_star_pos_radius[s].w;
+        if (ds < 9.0 * sr * sr) {
+          glow += u_star_color[s].rgb * u_star_color[s].a * glow_gain *
+                  exp(-ds / (sr * sr * 0.5));
+        }
+        // Luminous trail: history points with fading intensity (w = 0 ends
+        // the streak). Narrower than the ball, comet-streak look.
+        for (int k = 0; k < k_star_trail; ++k) {
+          const vec4 tp = u_star_trail[s * k_star_trail + k];
+          if (tp.w <= 0.0) {
+            break;
+          }
+          const vec3 dq = p - tp.xyz;
+          const float dq2 = dot(dq, dq);
+          if (dq2 < 4.0) {
+            glow += u_star_color[s].rgb * tp.w * glow_gain *
+                    exp(-dq2 / 0.36);
+          }
         }
       }
     }
@@ -546,7 +674,7 @@ vec3 trace_ray(vec3 dir, out float surface_distance)
     float alpha;
     // lambda for the g-factor is the arriving photon's Lz/E = -xi
     // (the traced branch runs the same curve in the opposite direction).
-    disk_emission(hit_r[i], hit_ph[i], -xi, emission, alpha);
+    disk_emission(hit_r[i], hit_ph[i], -xi, hit_mu[i], emission, alpha);
     color = mix(color, emission, alpha);
   }
   // Ergosphere glow only on rays that pierce and escape: captured rays all
@@ -597,6 +725,7 @@ layout(location = 0) in vec3 a_position;
 
 uniform mat4 u_mvp;
 uniform float u_mass;
+uniform float u_grid_max_radius;
 uniform vec2 u_resolution;
 uniform float u_pixel;
 
@@ -606,10 +735,19 @@ void main()
 {
   const float radius = length(a_position.xy);
   vec3 position = a_position;
-  // Rubber-sheet depression: z ~ -70M / (r + 2) — a ~-35M funnel at the
-  // center, sitting just below z = 0 so the equatorial disk (ray-traced at
-  // z = 0) never z-fights with it.
-  position.z = -70.0 * u_mass / (radius + 2.0) - 0.02;
+  // Flamm paraboloid: the exact equatorial Schwarzschild embedding
+  // w(r) = 2*sqrt(rs*(r - rs)), hung from the rim so the funnel deepens
+  // toward the horizon. No Euclidean embedding exists inside rs: the pit
+  // continues linearly to a floor (capped, noted). Still a raster overlay,
+  // not lensed ray tracing — shape only. The -0.02 keeps it just below the
+  // ray-traced disk (z = 0) so they never z-fight.
+  const float rs = 2.0 * u_mass;
+  const float w_rim = 2.0 * sqrt(rs * max(u_grid_max_radius - rs, 0.0));
+  float w = 2.0 * sqrt(rs * max(radius - rs, 0.0));
+  if (radius < rs) {
+    w = -6.0 * (rs - radius);
+  }
+  position.z = -(w_rim - w) - 0.02;
   v_radius = radius;
   vec4 clip = u_mvp * vec4(position, 1.0);
   // Same block snap as the ray tracer so the grid joins the retro look.

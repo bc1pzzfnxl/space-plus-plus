@@ -115,13 +115,15 @@ private:
   static constexpr glm::vec3 k_world_up{0.0F, 0.0F, 1.0F};
 };
 
-// Accretion disk parameters (spec section 4): inner edge defaults to the
-// Schwarzschild ISCO (6M); spin overrides it with kerr_isco.
+// Accretion disk parameters (spec section 4): the inner edge IS the Kerr
+// ISCO (derived, no override); the outer edge is a free modeling choice
+// (the spec fixes no r_out); spin and Eddington ratio are free parameters.
 struct DiskParams {
   float inner_radius = 6.0F;
   float outer_radius = 16.0F;
   float peak_temperature = 5200.0F;
-  float brightness = 1.2F;
+  float brightness = 1.2F;      // exposure (artistic, no formula behind it)
+  float eddington_ratio = 1.0F;  // mdot = Mdot/Mdot_Edd in [0.01, 1]
 };
 
 // Kerr ISCO (spec section 2.2); sign(a) selects the co-rotating family
@@ -207,9 +209,9 @@ struct Comet {
   bool alive = false;
 };
 
-// Perpetual particle swarm: one fixed dphi step per rendered frame, a soft
-// population target topped up over time, and capture/escape recycling so
-// the scene never empties (E/B sandbox).
+// Timelike debris slots for tidal disruption events: one fixed dphi step
+// per rendered frame; dead slots stay dead (no ambient swarm, no top-up),
+// so the glow shader skips everything at rest.
 struct CometSystem {
   static constexpr int k_count = 16;
   static constexpr int k_trail = 8;
@@ -221,73 +223,26 @@ struct CometSystem {
   std::array<glm::vec4, k_count> head_uniforms{};                 // xyz + intensity
   std::array<glm::vec4, k_count * k_trail> trail_uniforms{};      // xyz + fade
 
-  bool running = true;         // live from launch: this is a sandbox
-  float speed = 1.0F;          // simulated steps per rendered frame (0.25 .. 4)
+  bool running = true;         // event clock (Pause button, Drop auto-starts)
+  bool visible = true;         // purist mode hides the glow, sim keeps running
+  float speed = 1.0F;          // simulated steps per rendered frame
   float time_scale = 1.0F;     // Kepler clock (1/ sqrt(M/M_sun)): heavier = slower
-  float spawn_radius = 18.0F;  // r at birth [M]
-  float eccentricity = 0.3F;   // 0.05 .. 0.6: distance from circular
-  float max_inclination = 2.4F;
-  int population = 12;         // soft target (4 .. 16)
-  int spawn_interval = 15;     // frames between top-up spawns
+  float eccentricity = 0.3F;   // debris orbit variety: distance from circular
+  float max_inclination = 2.4F;  // debris orbit variety
   int captured = 0;
   int frames = 0;
 
-  CometSystem() { reset(); }
+  // Debris backend for tidal disruption events: the field starts empty and
+  // only ever holds TDE debris (seed_debris). No ambient swarm, no top-up:
+  // dead slots stay dead, so the glow shader skips everything at rest.
+  CometSystem() = default;
 
-  void reset() noexcept
+  // Places an (already seeded) comet at point: its orbital plane is rotated
+  // to contain the position vector, tilted up to +-tilt_max around the
+  // radial axis. Used by TDE debris for the explosion cone.
+  void orient_at(Comet& comet, const glm::vec3& point, float tilt_max) noexcept
   {
-    captured = 0;
-    frames = 0;
-    accumulator_ = 0.0F;
-    rng_.seed(12345U);  // deterministic replay
-    for (int i = 0; i < k_count; ++i) {
-      comets[static_cast<std::size_t>(i)] = Comet{};
-      publish(i);
-    }
-    const int seed_n = std::min(population, k_count);
-    for (int i = 0; i < seed_n; ++i) {
-      seed_fresh(i);
-      publish(i);
-    }
-  }
-
-  // Spawns one particle into a free slot (round-robin when the field is full).
-  void spawn() noexcept
-  {
-    const int slot = take_slot();
-    seed_fresh(slot);
-    publish(slot);
-  }
-
-  // Right-click launch: unproject (fx, fy) onto the equatorial plane and put
-  // a particle there (precessing orbit far out, plunge when clicked close in).
-  // No-op when the ray misses the plane or is outside the sandbox range.
-  void spawn_at(const Camera& camera, float aspect, float fx, float fy) noexcept
-  {
-    const float tan_half = std::tan(glm::radians(camera.vertical_fov_degrees) * 0.5F);
-    const float ndc_x = 2.0F * fx - 1.0F;
-    const float ndc_y = 1.0F - 2.0F * fy;
-    const glm::vec3 dir = glm::normalize(
-        camera.forward() +
-        ndc_x * aspect * tan_half * camera.right() +
-        ndc_y * tan_half * camera.up());
-    if (dir.z >= -1e-6F) {
-      return;  // ray never reaches the disk plane
-    }
-    const float t = -camera.position.z / dir.z;
-    if (t <= 0.0F) {
-      return;
-    }
-    // Lift off the disk plane: a point exactly at z = 0 would hide its own
-    // glow behind the disk; 1.8M above it keeps the launch always visible.
-    const glm::vec3 point = camera.position + t * dir + glm::vec3{0.0F, 0.0F, 1.8F};
     const float radius = glm::length(point);
-    if (radius < 5.0F || radius > 45.0F) {
-      return;  // inside the horizon shell or outside the sandbox grid
-    }
-
-    // Any orbit plane contains the position vector and the origin; tilt it
-    // up to +-10 deg around the radial axis for depth variety.
     const glm::vec3 radial = point / radius;
     glm::vec3 seed_axis{0.0F, 0.0F, 1.0F};
     if (std::abs(glm::dot(radial, seed_axis)) > 0.9F) {
@@ -295,14 +250,9 @@ struct CometSystem {
     }
     const glm::vec3 n0 = glm::normalize(glm::cross(radial, seed_axis));
     const glm::vec3 n1 = glm::cross(n0, radial);
-    const float tilt = 0.175F * (2.0F * unit_(rng_) - 1.0F);  // +-10 deg
+    const float tilt = tilt_max * (2.0F * unit_(rng_) - 1.0F);
     const glm::vec3 normal =
         std::cos(tilt) * n0 + std::sin(tilt) * n1;  // stays perpendicular
-
-    const int slot = take_slot();
-    Comet& comet = comets[static_cast<std::size_t>(slot)];
-    const float u0 = 1.0F / radius;
-    seed_orbit_geometry(comet, u0);
     comet.e1 = glm::normalize(glm::cross(normal, glm::vec3{0.0F, 0.0F, 1.0F}));
     comet.e2 = glm::cross(normal, comet.e1);
     comet.phi = std::atan2(glm::dot(point, comet.e2), glm::dot(point, comet.e1));
@@ -310,20 +260,21 @@ struct CometSystem {
     comet.trail[0] = point;
     comet.trail_len = 1;
     comet.alive = true;
-    publish(slot);
   }
 
-  // Empties the field: kills every particle and zeroes the counters.
-  void clear() noexcept
+  // TDE debris: count fresh orbits born AT point inside an explosion cone
+  // (not at a random radius like ambient spawns). Dead slots first, else
+  // round-robin overwrite like spawn().
+  void seed_debris(const glm::vec3& point, int count, float cone) noexcept
   {
-    for (int i = 0; i < k_count; ++i) {
-      comets[static_cast<std::size_t>(i)] = Comet{};
-      publish(i);
+    const float r = glm::length(point);
+    for (int n = 0; n < count; ++n) {
+      const int slot = take_slot();
+      Comet& comet = comets[static_cast<std::size_t>(slot)];
+      seed_orbit_geometry(comet, 1.0F / r);
+      orient_at(comet, point, cone);
+      publish(slot);
     }
-    captured = 0;
-    frames = 0;
-    accumulator_ = 0.0F;
-    running = false;
   }
 
   // Advances the simulation by `speed` steps per rendered frame, carrying the
@@ -343,13 +294,11 @@ struct CometSystem {
   }
 
   // Advances every live particle by one animation frame (frame-by-frame).
+  // Debris only: no top-up, no reseeding. Captured or escaped debris dies
+  // for good (alive_count falls back to zero on its own).
   void step() noexcept
   {
     ++frames;
-    if (spawn_interval > 0 && frames % spawn_interval == 0 &&
-        alive_count() < population) {
-      spawn();  // top the field back up to the target
-    }
     const float h = k_dphi_frame / static_cast<float>(k_substeps);
     for (int i = 0; i < k_count; ++i) {
       const auto index = static_cast<std::size_t>(i);
@@ -382,18 +331,13 @@ struct CometSystem {
       comet.phi += k_dphi_frame;
 
       // End of life: swallowed by the horizon, or slingshot past the
-      // sandbox edge. Recycle unless the field is already over target.
+      // sandbox edge. Debris dies for good (no ambient reseeding).
       if (comet.u >= 0.5F || comet.u <= k_escape_u || comet.u <= 0.0F) {
         if (comet.u >= 0.5F) {
           ++captured;
         }
-        if (alive_count() - 1 >= population) {  // over target: let it go
-          comet.alive = false;
-          publish(i);
-        } else {
-          seed_fresh(i);
-          publish(i);
-        }
+        comet.alive = false;
+        publish(i);
         continue;
       }
       // Push the head onto the trail history (newest first).
@@ -433,13 +377,6 @@ private:
     const int slot = round_robin_ % k_count;
     ++round_robin_;
     return slot;
-  }
-
-  // Birth at the current spawn radius with organic jitter.
-  void seed_fresh(int index) noexcept
-  {
-    const float r0 = spawn_radius * (0.8F + 0.4F * unit_(rng_));
-    seed_orbit_geometry(comets[static_cast<std::size_t>(index)], 1.0F / r0);
   }
 
   // Initializes the orbital constants of `comet` for a start at u0: 70% of
@@ -531,6 +468,163 @@ private:
   std::mt19937 rng_{12345U};
   std::uniform_real_distribution<float> unit_{};
 };
+
+// Tidal disruption event: a star dropped on a plunging equatorial orbit,
+// spaghettified while falling, torn at r_t into swarm debris plus a disk
+// heating flash. Manual trigger (Drop star button / --dropstar). The ball
+// glare, the stretch axis and the flash all decay through the shader
+// uniforms; the sim keeps the debris alive via the regular swarm slots.
+struct StarEvent {
+  static constexpr int k_slots = 3;        // concurrent stars (matches shader)
+  static constexpr float k_r_tidal = 9.0F;   // disruption radius [M]
+  static constexpr float k_r_min = 20.0F;    // drop radius range [M] (random)
+  static constexpr float k_r_max = 30.0F;
+  static constexpr float k_ball_r = 1.7F;    // ball radius [M] (readable)
+  static constexpr int k_debris = 8;
+  static constexpr int k_trail = 6;        // history points (matches shader)
+
+  bool active = false;
+  float u = 0.0F;
+  float w = 0.0F;
+  float phi = 0.0F;
+  float l = 0.0F;  // squared specific angular momentum (const of motion)
+  glm::vec3 e1{1.0F, 0.0F, 0.0F};  // inclined orbital plane basis (world)
+  glm::vec3 e2{0.0F, 1.0F, 0.0F};
+  glm::vec3 head{};
+  glm::vec3 axis{1.0F, 0.0F, 0.0F};  // spaghettification axis (unit)
+  std::array<glm::vec3, 6> trail{};  // recent heads, [0] = newest
+  int trail_len = 0;
+  float stretch = 1.0F;              // 1 = round, grows while falling
+  float intensity = 0.0F;            // ball glare (flash on disruption)
+  float boost = 0.0F;                // disk heating strength (decays)
+  float impact_r = 0.0F;
+
+  void drop(CometSystem& comets, float drop_phi)
+  {
+    // Plunger recipe (mirrors seed_orbit_geometry plungers): low angular
+    // momentum, start energy above the barrier top.
+    // drop_phi faces the camera (plus a random +-0.5 rad spread) so the
+    // event starts on the visible side, never behind the shadow. Drop
+    // radius is random too, so spammed stars stagger naturally.
+    // The orbital plane is tilted randomly (0.15..0.9 rad off equatorial):
+    // dives cross the disk at an angle instead of sliding inside it.
+    const float r0 = k_r_min + (k_r_max - k_r_min) * unit_(rng_);
+    u = 1.0F / r0;
+    const float l_circ = u * (1.0F - 3.0F * u);
+    l = l_circ * 0.3F;
+    const float v0 = (1.0F - 2.0F * u) * (u * u + l);
+    const float disc = std::max(1.0F - 12.0F * l, 0.0F);
+    const float u_star = (1.0F + std::sqrt(disc)) / 6.0F;  // V maximum
+    const float barrier = (1.0F - 2.0F * u_star) * (u_star * u_star + l);
+    w = std::sqrt(std::max(barrier - v0, 0.0F) + 0.02F);  // inward
+    phi = drop_phi + (unit_(rng_) - 0.5F) * 1.0F;
+    // In-plane basis: e1 = drop direction (camera side), e2 = normal x e1
+    // with the normal tilted off the z-axis for an inclined dive.
+    const glm::vec3 radial{std::cos(phi), std::sin(phi), 0.0F};
+    const glm::vec3 transverse = glm::normalize(
+        glm::cross(glm::vec3{0.0F, 0.0F, 1.0F}, radial));
+    const float tilt = 0.15F + 0.75F * unit_(rng_);
+    const glm::vec3 normal = std::cos(tilt) * glm::vec3{0.0F, 0.0F, 1.0F} +
+                             std::sin(tilt) * transverse;
+    e1 = radial - normal * glm::dot(radial, normal);  // radial lies in-plane
+    e1 = glm::normalize(e1);
+    e2 = glm::cross(normal, e1);
+    phi = 0.0F;  // head starts along e1 (camera side)
+    head = (1.0F / u) * e1;
+    trail[0] = head;
+    trail_len = 1;
+    axis = {1.0F, 0.0F, 0.0F};
+    stretch = 1.0F;
+    intensity = 2.0F;  // hot blue-white ball, readable against the beige disk
+    boost = 0.0F;
+    impact_r = 0.0F;
+    active = true;
+    comets.running = true;  // a drop starts the clock (never frozen-mysterious)
+  }
+
+  void advance(CometSystem& comets) noexcept
+  {
+    if (!active) {
+      intensity *= 0.93F;  // flash + heating decay after disruption (lingering)
+      boost *= 0.97F;
+      return;
+    }
+    // One CometSystem-style frame: fixed dphi, 2 RK4 substeps (M = 1).
+    // Lightning pacing: the fall lasts ~50 frames (~0.8 s). Independent of
+    // the swarm speed slider by design (event clock vs ambient clock).
+    constexpr float k_dphi = 0.007F;
+    const float h = k_dphi / 2.0F;
+    for (int s = 0; s < 2; ++s) {
+      // RK4 on (u, w): u' = w, w' = -u + 3u^2 + l (M = 1).
+      const auto deriv_w = [](float uu, float ll) noexcept {
+        return -uu + 3.0F * uu * uu + ll;
+      };
+      const float k1u = w;
+      const float k1w = deriv_w(u, l);
+      const float u2 = u + 0.5F * h * k1u;
+      const float w2 = w + 0.5F * h * k1w;
+      const float k2u = w2;
+      const float k2w = deriv_w(u2, l);
+      const float u3 = u + 0.5F * h * k2u;
+      const float w3 = w + 0.5F * h * k2w;
+      const float k3u = w3;
+      const float k3w = deriv_w(u3, l);
+      const float u4 = u + h * k3u;
+      const float w4 = w + h * k3w;
+      const float k4u = w4;
+      const float k4w = deriv_w(u4, l);
+      u += (h / 6.0F) * (k1u + 2.0F * k2u + 2.0F * k3u + k4u);
+      w += (h / 6.0F) * (k1w + 2.0F * k2w + 2.0F * k3w + k4w);
+    }
+    phi += k_dphi;
+    const float r = 1.0F / std::max(u, 1e-6F);
+    const glm::vec3 prev = head;
+    head = r * (std::cos(phi) * e1 + std::sin(phi) * e2);
+    // Push the head onto the trail history (newest first): the luminous
+    // streak behind the ball.
+    for (int k = k_trail - 1; k > 0; --k) {
+      trail[static_cast<std::size_t>(k)] =
+          trail[static_cast<std::size_t>(k - 1)];
+    }
+    trail[0] = head;
+    trail_len = std::min(trail_len + 1, k_trail);
+    const glm::vec3 motion = head - prev;
+    if (glm::length(motion) > 1e-6F) {
+      axis = glm::normalize(motion);
+    }
+    const float q = k_r_tidal / r;
+    stretch = std::min(1.0F + 3.0F * q * q, 8.0F);
+    if (r <= k_r_tidal) {
+      impact_r = r;
+      boost = 2.0F;
+      intensity = 6.0F;  // white flash (decays above)
+      comets.seed_debris(head, k_debris, 0.6F);
+      active = false;
+    } else if (u >= 0.5F) {
+      boost = 0.5F;  // direct-swallow fallback (r_t fires first in practice)
+      intensity = 2.0F;
+      active = false;
+    }
+  }
+
+ private:
+  std::mt19937 rng_{987U};
+  std::uniform_real_distribution<float> unit_{};
+};
+
+// Picks a dormant star slot for a new drop, else steals round-robin (the
+// oldest event is cut short). Spamming Drop star fills the sky, never
+// resets the ones already falling.
+[[nodiscard]] StarEvent& take_star_slot(std::array<StarEvent, StarEvent::k_slots>& stars)
+{
+  for (StarEvent& star : stars) {
+    if (!star.active && star.intensity < 0.05F && star.boost < 0.05F) {
+      return star;
+    }
+  }
+  static int rr = 0;  // all busy: steal round-robin
+  return stars[static_cast<std::size_t>(rr++ % StarEvent::k_slots)];
+}
 
 // Spec section 5: Schwarzschild thermodynamics, pure functions of mass (M_sun).
 namespace physics {
@@ -636,6 +730,10 @@ static_assert(mass_loss_rate_kg_s(1.0) < -1.0e-46 &&
   return program;
 }
 
+// Zeroed comet uniforms for purist mode (sim keeps running, glow hidden).
+const std::array<glm::vec4, 16> kZeroCometHeads{};
+const std::array<glm::vec4, 128> kZeroCometTrail{};
+
 // Fullscreen Schwarzschild ray-tracing pass (RAII, non-copyable: constructed once).
 class RaytracePass {
 public:
@@ -661,6 +759,12 @@ public:
     locations_.time = glGetUniformLocation(program_, "u_time");
     locations_.comet_head = glGetUniformLocation(program_, "u_comet_head[0]");
     locations_.comet_trail = glGetUniformLocation(program_, "u_comet_trail[0]");
+    locations_.star_pos_radius = glGetUniformLocation(program_, "u_star_pos_radius");
+    locations_.star_axis_stretch =
+        glGetUniformLocation(program_, "u_star_axis_stretch");
+    locations_.star_color = glGetUniformLocation(program_, "u_star_color");
+    locations_.star_trail = glGetUniformLocation(program_, "u_star_trail");
+    locations_.impact = glGetUniformLocation(program_, "u_impact");
     locations_.resolution = glGetUniformLocation(program_, "u_resolution");
     locations_.pixel = glGetUniformLocation(program_, "u_pixel");
     locations_.realism = glGetUniformLocation(program_, "u_realism");
@@ -676,8 +780,9 @@ public:
   RaytracePass& operator=(const RaytracePass&) = delete;
 
   void draw(const Camera& camera, const DiskParams& disk, const CometSystem& comets,
-            int width, int height, float time_seconds, float pixel_size,
-            float spin, const glm::vec4& realism) const
+            const std::array<StarEvent, StarEvent::k_slots>& stars, int width,
+            int height, float time_seconds, float pixel_size, float spin,
+            const glm::vec4& realism) const
   {
     glViewport(0, 0, width, height);
     glUseProgram(program_);
@@ -707,9 +812,49 @@ public:
                 static_cast<float>(height));
     glUniform1f(locations_.pixel, pixel_size);
     glUniform4fv(locations_.comet_head, CometSystem::k_count,
-                 glm::value_ptr(comets.head_uniforms[0]));
-    glUniform4fv(locations_.comet_trail, CometSystem::k_count * CometSystem::k_trail,
-                 glm::value_ptr(comets.trail_uniforms[0]));
+                 glm::value_ptr((comets.visible ? comets.head_uniforms
+                                                : kZeroCometHeads)[0]));
+    glUniform4fv(locations_.comet_trail,
+                 CometSystem::k_count * CometSystem::k_trail,
+                 glm::value_ptr((comets.visible ? comets.trail_uniforms
+                                                : kZeroCometTrail)[0]));
+    // TDE star uniforms (ball radius 0 fully disables the shader branch).
+    // Trail fades derive from the live intensity, so the streak dies with
+    // the flash after disruption.
+    glm::vec4 star_pr[StarEvent::k_slots];
+    glm::vec4 star_as[StarEvent::k_slots];
+    glm::vec4 star_col[StarEvent::k_slots];
+    glm::vec4 star_trail[StarEvent::k_slots * StarEvent::k_trail];
+    glm::vec2 impact[StarEvent::k_slots];
+    for (int s = 0; s < StarEvent::k_slots; ++s) {
+      const StarEvent& star = stars[static_cast<std::size_t>(s)];
+      const float sr =
+          (star.intensity > 0.02F || star.active) ? StarEvent::k_ball_r : 0.0F;
+      star_pr[s] = glm::vec4(star.head, sr);
+      star_as[s] = glm::vec4(star.axis, star.stretch);
+      star_col[s] = glm::vec4(0.8F, 0.9F, 1.0F, star.intensity);  // blue-white
+      impact[s] = glm::vec2(star.impact_r, star.boost);
+      for (int k = 0; k < StarEvent::k_trail; ++k) {
+        float fade = 0.0F;
+        if (k < star.trail_len) {
+          fade = star.intensity * (1.0F - static_cast<float>(k) /
+                                             StarEvent::k_trail);
+        }
+        star_trail[s * StarEvent::k_trail + k] =
+            glm::vec4(star.trail[static_cast<std::size_t>(k)], fade);
+      }
+    }
+    glUniform4fv(locations_.star_pos_radius, StarEvent::k_slots,
+                 glm::value_ptr(star_pr[0]));
+    glUniform4fv(locations_.star_axis_stretch, StarEvent::k_slots,
+                 glm::value_ptr(star_as[0]));
+    glUniform4fv(locations_.star_color, StarEvent::k_slots,
+                 glm::value_ptr(star_col[0]));
+    glUniform4fv(locations_.star_trail,
+                 StarEvent::k_slots * StarEvent::k_trail,
+                 glm::value_ptr(star_trail[0]));
+    glUniform2fv(locations_.impact, StarEvent::k_slots,
+                 glm::value_ptr(impact[0]));
     glUniform4f(locations_.realism, realism.x, realism.y, realism.z, realism.w);
 
     glBindVertexArray(vao_);
@@ -736,6 +881,11 @@ private:
     GLint time = -1;
     GLint comet_head = -1;
     GLint comet_trail = -1;
+    GLint star_pos_radius = -1;
+    GLint star_axis_stretch = -1;
+    GLint star_color = -1;
+    GLint star_trail = -1;
+    GLint impact = -1;
     GLint resolution = -1;
     GLint pixel = -1;
   };
@@ -887,11 +1037,15 @@ public:
   }
 
   // Blur passes then composite onto the currently bound default framebuffer.
-  void render(int width, int height, float pixel_size, float bloom_strength)
+  // The scene may be smaller than the output (render scale): texture-space
+  // math uses the scene size, the composite covers the full output (the
+  // texture sampler upscales for free, FXAA runs at output resolution).
+  void render(int scene_w, int scene_h, int out_w, int out_h,
+              float pixel_size, float bloom_strength)
   {
-    scene_fbo(width, height);
-    const int qw = width / 4 > 0 ? width / 4 : 1;
-    const int qh = height / 4 > 0 ? height / 4 : 1;
+    scene_fbo(scene_w, scene_h);
+    const int qw = scene_w / 4 > 0 ? scene_w / 4 : 1;
+    const int qh = scene_h / 4 > 0 ? scene_h / 4 : 1;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -903,8 +1057,8 @@ public:
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, scene_color_);
     glUniform1i(blur_scene_, 0);
-    glUniform2f(blur_texel_, 1.0F / static_cast<float>(width),
-                1.0F / static_cast<float>(height));
+    glUniform2f(blur_texel_, 1.0F / static_cast<float>(scene_w),
+                1.0F / static_cast<float>(scene_h));
     glUniform2f(blur_dir_, 1.0F, 0.0F);
     glUniform1f(blur_threshold_, 0.35F);
     draw_fullscreen();
@@ -921,7 +1075,7 @@ public:
 
     // Composite onto the backbuffer.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, width, height);
+    glViewport(0, 0, out_w, out_h);
     glUseProgram(composite_program_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, scene_color_);
@@ -931,10 +1085,41 @@ public:
     glUniform1i(comp_bloom_, 1);
     glActiveTexture(GL_TEXTURE0);
     glUniform1f(comp_strength_, bloom_strength);
-    glUniform2f(comp_resolution_, static_cast<float>(width),
-                static_cast<float>(height));
+    glUniform2f(comp_resolution_, static_cast<float>(out_w),
+                static_cast<float>(out_h));
     glUniform1f(comp_pixel_, pixel_size);
+    // Color only: the backbuffer depth is filled separately (depth blit),
+    // otherwise the fullscreen quad would poison it with a flat value and
+    // the crisp grid drawn afterwards would depth-test against garbage.
+    glDepthMask(GL_FALSE);
     draw_fullscreen();
+    glDepthMask(GL_TRUE);
+  }
+
+  // Fast path without polish: blit the scaled scene (color + depth) onto the
+  // backbuffer. Color upscales smooth (LINEAR) or pixelated (NEAREST, retro),
+  // depth always with NEAREST so later full-res work depth-tests correctly.
+  void blit_to_screen(int out_w, int out_h, bool pixelated)
+  {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, scene_fbo_);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, width_, height_, 0, 0, out_w, out_h,
+                      GL_COLOR_BUFFER_BIT,
+                      pixelated ? GL_NEAREST : GL_LINEAR);
+    glBlitFramebuffer(0, 0, width_, height_, 0, 0, out_w, out_h,
+                      GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
+
+  // Depth only (used after the polish composite, which outputs color): lets
+  // a later full-res pass depth-test against the scaled scene.
+  void blit_depth_to_screen(int out_w, int out_h)
+  {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, scene_fbo_);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, width_, height_, 0, 0, out_w, out_h,
+                      GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
   }
 
 private:
@@ -1023,12 +1208,15 @@ struct RunOptions {
   int frame_limit = -1;             // -1 = run until quit
   std::string screenshot_path;      // empty = no screenshot
   std::optional<float> azimuth_degrees;  // camera orbit override for testing
+  std::optional<float> orbit_distance;   // camera distance [M] for testing
   std::optional<float> orbit_speed;      // auto-orbit rad/s (0 = static)
-  bool animate = false;             // start the swarm clock immediately
-  int spawn_count = 0;              // extra particles spawned at startup
-  std::optional<float> click_x;     // viewport fraction for a launch at start
-  std::optional<float> click_y;
+  bool animate = false;             // start the event clock immediately
+  int drop_star_count = 0;          // TDE stars dropped at startup (0 = none)
   float pixel_size = 1.0F;          // retro block size (1 = native)
+  bool auto_quality = false;      // step render scale to hold ~60 fps
+  float render_scale = 1.0F;      // raytrace/grid resolution factor (0.25..1)
+  bool upscale_nearest = false;   // pixelated (nearest) vs smooth upscale
+  bool fullscreen = false;          // borderless fullscreen at startup
   bool polish = false;              // bloom + FXAA post chain
   float mass_solar = 1.0F;          // section-5 mass slider override
   float spin = 0.0F;                // dimensionless Kerr spin a* [-0.95, 0.95]
@@ -1046,20 +1234,32 @@ struct RunOptions {
       options.screenshot_path = argv[++i];
     } else if (arg == "--az" && i + 1 < argc) {
       options.azimuth_degrees = std::strtof(argv[++i], nullptr);
+    } else if (arg == "--dist" && i + 1 < argc) {
+      options.orbit_distance = std::strtof(argv[++i], nullptr);
     } else if (arg == "--orbit" && i + 1 < argc) {
       options.orbit_speed = std::strtof(argv[++i], nullptr);
     } else if (arg == "--anim") {
       options.animate = true;
-    } else if (arg == "--spawn" && i + 1 < argc) {
-      options.spawn_count = std::atoi(argv[++i]);
-    } else if (arg == "--click" && i + 2 < argc) {
-      options.click_x = std::strtof(argv[++i], nullptr);
-      options.click_y = std::strtof(argv[++i], nullptr);
+    } else if (arg == "--dropstar") {
+      options.drop_star_count = 1;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        options.drop_star_count =
+            std::clamp(std::atoi(argv[++i]), 1, StarEvent::k_slots);
+      }
     } else if (arg == "--pixel") {
       options.pixel_size = 4.0F;
       if (i + 1 < argc && argv[i + 1][0] != '-') {
         options.pixel_size = std::strtof(argv[++i], nullptr);
       }
+    } else if (arg == "--autoq") {
+      options.auto_quality = true;
+    } else if (arg == "--scale" && i + 1 < argc) {
+      options.render_scale =
+          std::clamp(std::strtof(argv[++i], nullptr), 0.1F, 1.0F);
+    } else if (arg == "--pixup") {
+      options.upscale_nearest = true;
+    } else if (arg == "--fullscreen") {
+      options.fullscreen = true;
     } else if (arg == "--polish") {
       options.polish = true;
     } else if (arg == "--mass" && i + 1 < argc) {
@@ -1069,8 +1269,8 @@ struct RunOptions {
     } else {
       throw std::invalid_argument{
           "usage: blackhole [--frames N] [--screenshot file.bmp] "
-          "[--az degrees] [--orbit rad/s] [--anim] [--spawn N] [--click fx fy] "
-          "[--pixel [N]] [--polish] [--mass M_sun] [--spin A]"};
+          "[--az degrees] [--dist M] [--orbit rad/s] [--anim] [--dropstar [N]] "
+          "[--pixel [N]] [--autoq] [--scale f] [--pixup] [--fullscreen] [--polish] [--mass M_sun] [--spin A]"};
     }
   }
   if (!options.screenshot_path.empty() && options.frame_limit < 0) {
@@ -1147,6 +1347,14 @@ void print_gl_info()
 // Rendering prefs (retro block size, polish chain) — shared by CLI and UI.
 struct RenderPrefs {
   float pixel_size = 1.0F;
+  bool auto_quality = false;  // step render scale to hold ~60 fps
+  float render_scale = 1.0F;  // raytrace/grid resolution factor (0.1..1)
+  int auto_scale_idx = 0;     // index into kAutoScales while auto is on
+  bool upscale_nearest = false;  // pixelated (nearest) vs smooth upscale
+  bool fullscreen = false;       // borderless fullscreen (F11)
+  bool physical_colors = false;  // true NT Kelvin (blue-hot) vs stylized beige
+  bool lock_meters = true;       // camera fixed in physical meters: mass visibly rescales the scene
+  bool show_grid = true;
   bool polish = false;
   float bloom_strength = 0.5F;
   bool realism_plunge = true;
@@ -1155,10 +1363,52 @@ struct RenderPrefs {
   bool realism_turbulence = true;
 };
 
+// Novikov-Thorne scaling at fixed radiative efficiency: T^4 ~ Mdot/M^2.
+// Written with the Eddington ratio mdot = Mdot/Mdot_Edd (Mdot_Edd ~ M), so
+// T_peak = 5200 K * mdot^1/4 * M_sun^-1/4, normalized to the default look
+// (5200 K at 1 M_sun, Eddington). Fully derived: no manual override.
+[[nodiscard]] float peak_temp_for_mass(float mass_solar, float eddington)
+{
+  const float m = std::clamp(mass_solar, 0.1F, 100.0F);
+  const float e = std::clamp(eddington, 0.01F, 1.0F);
+  return std::clamp(5200.0F * std::pow(e, 0.25F) * std::pow(m, -0.25F),
+                    1000.0F, 15000.0F);
+}
+
+// True Novikov-Thorne scale (physical-colors mode): peak color temperature
+// ~1.4e7 K for a 10 M_sun hole at Eddington, T ~ M^-1/4 mdot^1/4. Blue-hot
+// instead of the stylized beige default.
+[[nodiscard]] float nt_peak_temp(float mass_solar, float eddington)
+{
+  const float m = std::clamp(mass_solar, 0.1F, 100.0F);
+  const float e = std::clamp(eddington, 0.01F, 1.0F);
+  return 1.4e7F * std::pow(m / 10.0F, -0.25F) * std::pow(e, 0.25F);
+}
+
+// Render-scale steps driven by the auto quality scaler: raytrace/grid work
+// scales with the square, so 0.5x costs ~1/4 and 0.15x ~1/44 of full res
+// (kavan-style pixelation, Kerr physics untouched).
+inline constexpr float kAutoScales[] = {1.0F,  0.8F, 0.65F, 0.5F, 0.4F,
+                                        0.3F, 0.25F, 0.2F, 0.15F, 0.12F,
+                                        0.1F};
+inline constexpr int kAutoScaleCount = 11;
+
+[[nodiscard]] int nearest_scale_index(float scale) noexcept
+{
+  int best = 0;
+  for (int i = 1; i < kAutoScaleCount; ++i) {
+    if (std::fabs(kAutoScales[i] - scale) < std::fabs(kAutoScales[best] - scale)) {
+      best = i;
+    }
+  }
+  return best;
+}
+
 // English control panel (spec section 3): camera, disk, animation, thermodynamics.
 void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
-                      CometSystem& comets, RenderPrefs& render_prefs,
-                      float& spin)
+                       CometSystem& comets, RenderPrefs& render_prefs,
+                       float& spin,
+                       std::array<StarEvent, StarEvent::k_slots>& stars)
 {
   const float azimuth_max = static_cast<float>(physics::k_pi);
 
@@ -1171,6 +1421,10 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
                      k_max_elevation, "%.2f rad");
   ImGui::SliderFloat("Distance", &orbit.distance, k_min_orbit_distance,
                      k_max_orbit_distance);
+  // Physical readout: with the meters lock on, THIS is what stays fixed
+  // while the mass slider moves (1477 m per solar mass per M unit).
+  ImGui::TextDisabled("= %.3g m physical",
+                      (double)(orbit.distance * mass_solar * 1477.0F));
   ImGui::SliderFloat("Field of view", &orbit.vertical_fov_degrees, 25.0F, 100.0F);
   ImGui::Checkbox("Auto-orbit", &orbit.auto_orbit);
   ImGui::SameLine();
@@ -1193,51 +1447,62 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   }
   ImGui::Separator();
   ImGui::TextUnformatted("Accretion disk");
-  if (ImGui::SliderFloat("Spin a*", &spin, -0.95F, 0.95F, "%.2f")) {
-    disk.inner_radius = kerr_isco(spin);
-  }
-  ImGui::SliderFloat("Inner radius", &disk.inner_radius, 1.0F, 10.0F, "%.1f M");
-  ImGui::SliderFloat("Outer radius", &disk.outer_radius, disk.inner_radius + 1.0F,
-                     40.0F, "%.1f M");
-  ImGui::SliderFloat("Peak temperature", &disk.peak_temperature, 1000.0F,
-                     15000.0F, "%.0f K");
+  ImGui::SliderFloat("Spin a*", &spin, -0.95F, 0.95F, "%.2f");
+  // Strict maths: the inner edge IS the Kerr ISCO (spec 2.2) — derived from
+  // the spin every frame, no manual override.
+  disk.inner_radius = kerr_isco(spin);
+  ImGui::TextDisabled("Inner radius: %.2f M (ISCO)", disk.inner_radius);
+  // Outer edge: free modeling choice (the spec fixes no r_out), shown as a
+  // multiple of the ISCO so the proportion stays readable.
+  ImGui::SliderFloat("Outer radius", &disk.outer_radius,
+                     disk.inner_radius + 1.0F, 40.0F, "%.1f M");
+  ImGui::TextDisabled("= x%.2f ISCO", disk.outer_radius / kerr_isco(spin));
+  // Strict maths: Novikov-Thorne peak temperature derived from the mass and
+  // the Eddington ratio — both free parameters, the temperature never is.
+  ImGui::SliderFloat("Eddington ratio", &disk.eddington_ratio, 0.01F, 1.0F,
+                     "%.2f", ImGuiSliderFlags_Logarithmic);
+  ImGui::Checkbox("Physical colors (true Kelvin, blue-hot)",
+                  &render_prefs.physical_colors);
+  disk.peak_temperature = render_prefs.physical_colors
+                              ? nt_peak_temp(mass_solar, disk.eddington_ratio)
+                              : peak_temp_for_mass(mass_solar,
+                                                   disk.eddington_ratio);
+  ImGui::TextDisabled("Peak temperature: %.3g K (%s)", disk.peak_temperature,
+                      render_prefs.physical_colors ? "true NT scale"
+                                                   : "stylized");
   ImGui::SliderFloat("Brightness", &disk.brightness, 0.1F, 5.0F);
   ImGui::Separator();
-  ImGui::TextUnformatted("Simulation (particle swarm)");
+  ImGui::TextUnformatted("Tidal disruption");
   if (ImGui::Button(comets.running ? "Pause" : "Play")) {
-    if (!comets.running && comets.alive_count() == 0) {
-      comets.reset();  // relaunch once the field was cleared
-    }
     comets.running = !comets.running;
   }
   ImGui::SameLine();
-  if (ImGui::Button("Step") && !comets.running) {
-    comets.step();  // single frame-by-frame advance while paused
+  // Drop a star on a plunging orbit; it stretches while falling, tears at
+  // 9M into debris and flashes the disk. Debris lives in the particle
+  // slots (invisible backend): no ambient swarm, no GPU cost at rest.
+  // Spamming fills every slot; a full sky steals the oldest event.
+  if (ImGui::Button("Drop star")) {
+    take_star_slot(stars).drop(comets, orbit.azimuth);
   }
   ImGui::SameLine();
-  if (ImGui::Button("Reset")) {
-    comets.reset();
+  int falling = 0;
+  float nearest = 0.0F;
+  bool heating = false;
+  for (const StarEvent& star : stars) {
+    if (star.active) {
+      ++falling;
+      const float r = 1.0F / std::max(star.u, 1e-6F);
+      nearest = falling == 1 ? r : std::min(nearest, r);
+    }
+    heating = heating || star.boost > 0.02F;
   }
-  ImGui::SliderFloat("Speed", &comets.speed, 0.25F, 4.0F, "x%.2f");
-  ImGui::Text("Frame: %d   Alive: %d   Captured: %d", comets.frames,
-              comets.alive_count(), comets.captured);
-  ImGui::Separator();
-  ImGui::TextUnformatted("Swarm lab");
-  if (ImGui::Button("Spawn particle")) {
-    comets.spawn();
+  if (falling > 0) {
+    ImGui::Text("%dx falling r~%.1fM", falling, nearest);
+  } else if (heating) {
+    ImGui::Text("disrupted! %d debris", comets.alive_count());
+  } else {
+    ImGui::TextDisabled("no star");
   }
-  ImGui::SameLine();
-  if (ImGui::Button("Clear")) {
-    comets.clear();
-  }
-  ImGui::SliderInt("Population", &comets.population, 4, CometSystem::k_count);
-  ImGui::SliderInt("Top-up every", &comets.spawn_interval, 4, 60, "%d frames");
-  ImGui::SliderFloat("Spawn radius", &comets.spawn_radius, 10.0F, 40.0F,
-                     "%.0f M");
-  ImGui::SliderFloat("Eccentricity", &comets.eccentricity, 0.05F, 0.6F, "e=%.2f");
-  ImGui::SliderFloat("Max inclination", &comets.max_inclination, 0.1F, 3.1F,
-                     "%.2f rad");
-  ImGui::TextDisabled("70%% bound orbits / 30%% plungers; captured slots respawn");
   ImGui::Separator();
   ImGui::TextUnformatted("Rendering");
   const ImGuiIO& render_io = ImGui::GetIO();
@@ -1247,13 +1512,51 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   }
   ImGui::SliderFloat("Pixel size", &render_prefs.pixel_size, 1.0F, 8.0F,
                      "%.0f px");
+  if (ImGui::IsItemEdited()) {
+    render_prefs.auto_quality = false;  // manual override wins
+  }
+  // Render scale drives raytrace/grid resolution (and fps); pixel size is
+  // a retro look only.
+  float scale_pct = render_prefs.render_scale * 100.0F;
+  if (ImGui::SliderFloat("Render scale", &scale_pct, 10.0F, 100.0F, "%.0f%%")) {
+    render_prefs.render_scale = scale_pct / 100.0F;
+    render_prefs.auto_quality = false;  // manual override wins
+  }
+  ImGui::Checkbox("Pixelated upscale (nearest, kavan-style)",
+                  &render_prefs.upscale_nearest);
+  ImGui::Checkbox("Fullscreen (F11)", &render_prefs.fullscreen);
+  ImGui::Checkbox("Show grid", &render_prefs.show_grid);
+  if (ImGui::Checkbox("Auto quality (hold ~60 fps)",
+                      &render_prefs.auto_quality) &&
+      render_prefs.auto_quality) {
+    // Resume the auto walk from the current scale.
+    render_prefs.auto_scale_idx = nearest_scale_index(render_prefs.render_scale);
+  }
+  if (render_prefs.auto_quality) {
+    ImGui::TextDisabled("auto scale: %.0f%%",
+                        kAutoScales[render_prefs.auto_scale_idx] * 100.0F);
+  }
   ImGui::Checkbox("Polish (bloom + FXAA)", &render_prefs.polish);
   ImGui::SameLine();
   ImGui::SetNextItemWidth(-1.0F);
+  if (!render_prefs.polish) {
+    ImGui::BeginDisabled();  // bloom strength is dead without the chain
+  }
   ImGui::SliderFloat("##bloom", &render_prefs.bloom_strength, 0.0F, 1.5F,
                      "Bloom x%.2f");
+  if (!render_prefs.polish) {
+    ImGui::EndDisabled();
+  }
   ImGui::Separator();
   ImGui::TextUnformatted("Realism");
+  if (ImGui::Button("Purist view (physics only)")) {
+    // One-way preset: rays, disk, starfield stay; decorative jets, ergosphere
+    // glow, swarm streaks and the stylized grid go. Re-enable each below.
+    render_prefs.realism_jets = false;
+    render_prefs.realism_ergo = false;
+    render_prefs.show_grid = false;
+    comets.visible = false;
+  }
   ImGui::Checkbox("Plunging region", &render_prefs.realism_plunge);
   ImGui::Checkbox("Polar jets", &render_prefs.realism_jets);
   ImGui::Checkbox("Ergosphere glow", &render_prefs.realism_ergo);
@@ -1262,11 +1565,28 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
 
   // Right column: keep clear of the Settings window on first use.
   const ImGuiIO& io = ImGui::GetIO();
+  // Previous mass for the meters-locked camera rescale (single call site).
+  static float last_mass_solar = -1.0F;
+  if (last_mass_solar < 0.0F) {
+    last_mass_solar = mass_solar;  // init (honors --mass)
+  }
   ImGui::SetNextWindowPos(ImVec2{io.DisplaySize.x - 320.0F, 60.0F},
                           ImGuiCond_Appearing);
   ImGui::SetNextWindowSize(ImVec2{300.0F, 0.0F}, ImGuiCond_Appearing);
   ImGui::Begin("Thermodynamics (spec section 5)");
-  ImGui::SliderFloat("Mass", &mass_solar, 0.1F, 100.0F, "%.1f M_sun");
+  if (ImGui::SliderFloat("Mass", &mass_solar, 0.1F, 100.0F, "%.1f M_sun")) {
+    // Camera locked in physical meters: hold the physical distance fixed, so
+    // a heavier hole visibly grows on screen (same physics, nearer in M).
+    // distance_M_new = distance_M_old * M_old / M_new.
+    if (render_prefs.lock_meters && last_mass_solar > 0.0F) {
+      orbit.distance =
+          std::clamp(orbit.distance * last_mass_solar / mass_solar,
+                     k_min_orbit_distance, k_max_orbit_distance);
+    }
+  }
+  last_mass_solar = mass_solar;
+  ImGui::Checkbox("Camera locked in physical meters",
+                  &render_prefs.lock_meters);
   ImGui::Text("Schwarzschild radius: %.5g m",
               physics::schwarzschild_radius(mass_solar));
   ImGui::Text("Photon sphere: %.5g m",
@@ -1282,6 +1602,9 @@ void draw_settings_ui(OrbitState& orbit, DiskParams& disk, float& mass_solar,
   ImGui::Text("dM/dt: %.5g kg/s", physics::mass_loss_rate_kg_s(mass_solar));
   ImGui::Text("Evaporation time: %.5g years",
               physics::evaporation_time_years(mass_solar));
+  ImGui::TextDisabled("Geometric units (M = 1) are scale-invariant: with the");
+  ImGui::TextDisabled("camera locked in meters, a heavier hole looks bigger;");
+  ImGui::TextDisabled("mass also drives thermo rows, grid depth, clocks, T.");
   ImGui::End();
 }
 
@@ -1348,31 +1671,59 @@ int main(int argc, char* argv[])
     PostChain post_chain;
     RenderPrefs render_prefs;
     render_prefs.pixel_size = glm::max(options.pixel_size, 1.0F);
+    render_prefs.auto_quality = options.auto_quality;
+    render_prefs.render_scale =
+        std::clamp(options.render_scale, 0.1F, 1.0F);
+    render_prefs.upscale_nearest = options.upscale_nearest;
+    render_prefs.fullscreen = options.fullscreen;
+    render_prefs.auto_scale_idx = nearest_scale_index(render_prefs.render_scale);
     render_prefs.polish = options.polish;
     DiskParams disk;
+    disk.peak_temperature =
+        peak_temp_for_mass(options.mass_solar, disk.eddington_ratio);
     float hud_mass_solar = options.mass_solar;
     float hud_spin = options.spin;
     disk.inner_radius = kerr_isco(std::clamp(hud_spin, -0.95F, 0.95F));
     CometSystem comets;
+    std::array<StarEvent, StarEvent::k_slots> stars;
     if (options.animate) {
       comets.running = true;
-    }
-    for (int i = 0; i < options.spawn_count; ++i) {
-      comets.spawn();
     }
     OrbitState orbit;
     if (options.azimuth_degrees.has_value()) {
       orbit.azimuth = glm::radians(*options.azimuth_degrees);
     }
+    if (options.orbit_distance.has_value()) {
+      orbit.distance =
+          std::clamp(*options.orbit_distance, k_min_orbit_distance,
+                     k_max_orbit_distance);
+    }
     if (options.orbit_speed.has_value()) {
       orbit.orbit_speed = *options.orbit_speed;
       orbit.auto_orbit = *options.orbit_speed != 0.0F;
+    }
+    if (render_prefs.lock_meters && options.mass_solar != 1.0F) {
+      // Startup version of the slider rule: hold physical distance, so a
+      // heavier hole already fills more of the first frame.
+      orbit.distance =
+          std::clamp(orbit.distance / options.mass_solar,
+                     k_min_orbit_distance, k_max_orbit_distance);
+    }
+    if (options.drop_star_count > 0) {
+      for (int i = 0; i < options.drop_star_count; ++i) {
+        take_star_slot(stars).drop(comets, orbit.azimuth);
+      }
     }
 
     bool dragging = false;
     bool running = true;
     int frame = 0;
-    std::optional<std::pair<float, float>> pending_launch;  // right-click (fx, fy)
+    // Auto quality scaler state: EMA frame time + cooldown/calm counters.
+    const Uint64 tick_freq = SDL_GetPerformanceFrequency();
+    Uint64 last_ticks = SDL_GetPerformanceCounter();
+    double ema_ms = 16.0;
+    int auto_cooldown = 0;
+    int calm_frames = 0;
     while (running) {
       SDL_Event event{};
       while (SDL_PollEvent(&event) != 0) {
@@ -1382,6 +1733,9 @@ int main(int argc, char* argv[])
         }
         if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
           running = false;
+        }
+        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_F11) {
+          render_prefs.fullscreen = !render_prefs.fullscreen;
         }
         if (!ImGui::GetIO().WantCaptureMouse) {
           if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
@@ -1397,17 +1751,10 @@ int main(int argc, char* argv[])
           if (event.type == SDL_MOUSEWHEEL) {
             orbit.zoom(event.wheel.y);
           }
+          // Right-click drops a TDE star on the camera-facing side.
           if (event.type == SDL_MOUSEBUTTONDOWN &&
               event.button.button == SDL_BUTTON_RIGHT) {
-            int window_width = 0;
-            int window_height = 0;
-            SDL_GetWindowSize(window.get(), &window_width, &window_height);
-            if (window_width > 0 && window_height > 0) {
-              pending_launch = {static_cast<float>(event.button.x) /
-                                    static_cast<float>(window_width),
-                                static_cast<float>(event.button.y) /
-                                    static_cast<float>(window_height)};
-            }
+            take_star_slot(stars).drop(comets, orbit.azimuth);
           }
         }
       }
@@ -1415,6 +1762,13 @@ int main(int argc, char* argv[])
       int drawable_width = 0;
       int drawable_height = 0;
       SDL_GL_GetDrawableSize(window.get(), &drawable_width, &drawable_height);
+
+      // Fullscreen toggle (F11 / checkbox / --fullscreen): borderless
+      // desktop mode, no display-mode change. FBOs follow resizes alone.
+      const Uint32 want_fs = render_prefs.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+      if ((SDL_GetWindowFlags(window.get()) & SDL_WINDOW_FULLSCREEN_DESKTOP) != want_fs) {
+        SDL_SetWindowFullscreen(window.get(), want_fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+      }
 
       if (drawable_width > 0 && drawable_height > 0) {
         if (orbit.auto_orbit && !dragging) {
@@ -1429,26 +1783,17 @@ int main(int argc, char* argv[])
         const glm::mat4 view = glm::lookAt(camera.position, camera.target,
                                            glm::vec3{0.0F, 0.0F, 1.0F});
 
-        // Launches: CLI --click once at startup, right-click any time after.
-        if (options.click_x.has_value()) {
-          comets.spawn_at(camera, aspect, *options.click_x, *options.click_y);
-          options.click_x.reset();
-          options.click_y.reset();
-        }
-        if (pending_launch.has_value()) {
-          comets.spawn_at(camera, aspect, pending_launch->first,
-                          pending_launch->second);
-          pending_launch.reset();
-        }
-
         if (comets.running) {
           comets.advance();  // frame-by-frame advance at the chosen speed
+          for (StarEvent& star : stars) {
+            star.advance(comets);  // TDE stars fall on the same clock
+          }
         }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
         draw_settings_ui(orbit, disk, hud_mass_solar, comets, render_prefs,
-                         hud_spin);
+                         hud_spin, stars);
 
         // Spec section 5 mass slider now drives the scene: heavier = deeper
         // rubber-sheet funnel (compressed M^0.25) and slower orbital clocks
@@ -1458,31 +1803,78 @@ int main(int argc, char* argv[])
         const float time_speed = 1.0F / std::sqrt(mass_clamped);
         comets.time_scale = time_speed;
 
-        if (render_prefs.polish) {
+        // Raytrace into the currently bound framebuffer at the given size
+        // (full window, or scaled scene FBO when offscreen). The grid is
+        // always drawn separately at full resolution so it stays crisp.
+        auto draw_raytrace_at = [&](int target_width, int target_height) {
+          glEnable(GL_DEPTH_TEST);
+          glDepthFunc(GL_LEQUAL);
+          glDepthMask(GL_TRUE);
+          glClearColor(0.01F, 0.01F, 0.03F, 1.0F);
+          glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+          raytrace_pass.draw(camera, disk, comets, stars, target_width,
+                             target_height,
+                             // Scene clock in geometric units (4M per frame
+                             // at 60 fps): the disk pattern corotates at the
+                             // true Keplerian rate; the mass factor is the
+                             // artistic clock already documented.
+                             static_cast<float>(frame) * 4.0F * time_speed,
+                             render_prefs.pixel_size,
+                             std::clamp(hud_spin, -0.95F, 0.95F),
+                             glm::vec4(render_prefs.realism_plunge ? 1.0F
+                                                                   : 0.0F,
+                                       render_prefs.realism_jets ? 1.0F : 0.0F,
+                                       render_prefs.realism_ergo ? 1.0F : 0.0F,
+                                       render_prefs.realism_turbulence ? 1.0F
+                                                                       : 0.0F));
+        };
+
+        // Crisp full-res grid, depth-tested against the scene depth (blitted
+        // from the scaled FBO in the offscreen path, native in direct mode).
+        // Occlusion at the disk silhouette follows the blitted depth blocks:
+        // exact at full scale, chunky-consistent at low render scales.
+        auto draw_grid_at = [&](int target_width, int target_height) {
+          glViewport(0, 0, target_width, target_height);
+          glEnable(GL_DEPTH_TEST);
+          glDepthFunc(GL_LEQUAL);
+          glDepthMask(GL_TRUE);
+          grid_pass.draw(projection * view, target_width, target_height,
+                         render_prefs.pixel_size, grid_mass);
+        };
+
+        if (render_prefs.polish || render_prefs.render_scale < 0.999F) {
+          // Offscreen scene (polish chain and/or render scale): raytrace
+          // renders small, then color (+depth) comes back up to the window
+          // and the grid draws crisp at full resolution on top of it.
+          const int scene_width =
+              std::max(1, static_cast<int>(drawable_width *
+                                           render_prefs.render_scale));
+          const int scene_height =
+              std::max(1, static_cast<int>(drawable_height *
+                                           render_prefs.render_scale));
           glBindFramebuffer(GL_FRAMEBUFFER,
-                            post_chain.scene_fbo(drawable_width, drawable_height));
+                            post_chain.scene_fbo(scene_width, scene_height));
+          draw_raytrace_at(scene_width, scene_height);
+          if (render_prefs.polish) {
+            post_chain.render(scene_width, scene_height, drawable_width,
+                              drawable_height, render_prefs.pixel_size,
+                              render_prefs.bloom_strength);
+            // Composite writes color only: bring the scene depth along so
+            // the grid below depth-tests against the disk/horizon.
+            post_chain.blit_depth_to_screen(drawable_width, drawable_height);
+          } else {
+            post_chain.blit_to_screen(drawable_width, drawable_height,
+                                      render_prefs.upscale_nearest);
+          }
+          if (render_prefs.show_grid) {
+            draw_grid_at(drawable_width, drawable_height);
+          }
         } else {
           glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        }
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_LEQUAL);
-        glClearColor(0.01F, 0.01F, 0.03F, 1.0F);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        raytrace_pass.draw(camera, disk, comets, drawable_width, drawable_height,
-                           static_cast<float>(frame) / 60.0F * time_speed,
-                           render_prefs.pixel_size,
-                           std::clamp(hud_spin, -0.95F, 0.95F),
-                           glm::vec4(render_prefs.realism_plunge
-                                         ? 1.0F
-                                         : 0.0F,
-                                     render_prefs.realism_jets ? 1.0F : 0.0F,
-                                     render_prefs.realism_ergo ? 1.0F : 0.0F,
-                                     render_prefs.realism_turbulence ? 1.0F : 0.0F));
-        grid_pass.draw(projection * view, drawable_width, drawable_height,
-                       render_prefs.pixel_size, grid_mass);
-        if (render_prefs.polish) {
-          post_chain.render(drawable_width, drawable_height,
-                            render_prefs.pixel_size, render_prefs.bloom_strength);
+          draw_raytrace_at(drawable_width, drawable_height);
+          if (render_prefs.show_grid) {
+            draw_grid_at(drawable_width, drawable_height);
+          }
         }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         ImGui::Render();
@@ -1498,6 +1890,35 @@ int main(int argc, char* argv[])
       }
 
       SDL_GL_SwapWindow(window.get());
+
+      // Auto quality scaler: walk the render-scale steps (work scales with
+      // the square) to hold ~60 fps. Disabled for --frames runs so
+      // verification screenshots stay deterministic.
+      const Uint64 now_ticks = SDL_GetPerformanceCounter();
+      const double frame_ms = 1000.0 *
+                              static_cast<double>(now_ticks - last_ticks) /
+                              static_cast<double>(tick_freq);
+      last_ticks = now_ticks;
+      ema_ms += 0.08 * (frame_ms - ema_ms);
+      if (render_prefs.auto_quality && options.frame_limit < 0) {
+        if (--auto_cooldown <= 0) {
+          if (ema_ms > 19.0 &&
+              render_prefs.auto_scale_idx < kAutoScaleCount - 1) {
+            ++render_prefs.auto_scale_idx;  // too slow: render smaller
+            auto_cooldown = 30;
+            calm_frames = 0;
+          } else if (ema_ms < 11.0 && render_prefs.auto_scale_idx > 0) {
+            if (++calm_frames >= 4) {  // sustained headroom before stepping up
+              --render_prefs.auto_scale_idx;
+              calm_frames = 0;
+              auto_cooldown = 30;
+            }
+          } else {
+            calm_frames = 0;
+          }
+          render_prefs.render_scale = kAutoScales[render_prefs.auto_scale_idx];
+        }
+      }
 
       ++frame;
       if (options.frame_limit >= 0 && frame >= options.frame_limit) {

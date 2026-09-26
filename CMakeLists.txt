@@ -9,8 +9,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# SDL2: pkg-config on Unix, CMake package (vcpkg) on Windows.
-if(WIN32)
+# SDL2: pkg-config on Unix and MinGW, CMake package (vcpkg) on MSVC Windows.
+if(WIN32 AND NOT MINGW)
   find_package(SDL2 CONFIG REQUIRED)
   set(SDL2_LIBS SDL2::SDL2)
   if(TARGET SDL2::SDL2main)
